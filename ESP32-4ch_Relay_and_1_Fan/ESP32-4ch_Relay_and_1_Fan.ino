@@ -31,15 +31,15 @@ String mqtt_pass;
 String mqtt_topic_cmd;
 String mqtt_topic_state;
 
-// --- Controller Hardware Pin Definitions (ESP32-CAM Safe Layout) ---
-const int RelayPin1 = 12;       // Safe output pin on ESP32-CAM
-const int RelayPin2 = 13;       // Safe output pin on ESP32-CAM
-const int RelayPin3 = 14;       // Safe output pin on ESP32-CAM
-const int RelayPin4 = 15;       // Safe output pin on ESP32-CAM
-const int TriacPin  = 2;        // ESP32 safe output pin for TRIAC gate driver (MOC3021)
-const int ZeroCrossPin = 4;     // ESP32 safe input pin for ZCD optocoupler (PC817)
-const int IR_RECV_PIN = 16;     // IR receiver data pin (U2RXD on ESP32-CAM)
-const int CONFIG_BUTTON_PIN = 0;// Boot button for AP mode fallback
+// --- Controller Hardware Pin Definitions (ESP32 WROOM Safe Layout) ---
+const int RelayPin1 = 23;       // Output pin for Relay 1
+const int RelayPin2 = 22;       // Output pin for Relay 2
+const int RelayPin3 = 21;       // Output pin for Relay 3
+const int RelayPin4 = 19;       // Output pin for Relay 4
+const int TriacPin  = 18;       // Output pin for TRIAC gate driver (MOC3021)
+const int ZeroCrossPin = 34;    // Input-only pin for ZCD optocoupler (PC817)
+const int IR_RECV_PIN = 35;     // Input-only pin for IR receiver data
+const int CONFIG_BUTTON_PIN = 0;// On-board BOOT button for AP mode fallback
 
 // --- IR Remote Button Codes ---
 #define IR_Button_1    0xF50A7F80
@@ -127,7 +127,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32-CAM Home Automation Web Controller</title>
+    <title>ESP32 WROOM Home Automation Web Controller</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f8; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 650px; background: #ffffff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); position: relative; }
@@ -152,7 +152,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <body>
 <div class="container">
     <a href="/config" class="config-link">⚙️ Config</a>
-    <h2>ESP32-CAM Home Automation</h2>
+    <h2>ESP32 WROOM Home Automation</h2>
     <div class="card">
         <div class="card-title">ESP32 Status</div>
         <div id="connectionStatus" class="status-disconnected">Status: Connecting...</div>

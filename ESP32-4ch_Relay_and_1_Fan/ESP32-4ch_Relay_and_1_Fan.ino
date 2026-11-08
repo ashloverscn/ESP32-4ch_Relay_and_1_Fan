@@ -139,7 +139,7 @@ void enterAPMode();
 bool sendPeriodicStatus(void*);
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 
-// --- Main Dashboard HTML Template (WebSocket Enabled) ---
+// --- Main Dashboard HTML Template ---
 const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -225,13 +225,15 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         ws.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
-                if (data.POWER1 !== undefined) {
+                if (data.type === 'console_log') {
+                    appendConsole(data.message);
+                } else if (data.POWER1 !== undefined) {
                     updateRelayUI(1, data.POWER1 === 'ON');
                     updateRelayUI(2, data.POWER2 === 'ON');
                     updateRelayUI(3, data.POWER3 === 'ON');
                     updateRelayUI(4, data.POWER4 === 'ON');
+                    if (data.Dimmer !== undefined) document.getElementById('dimmerSlider').value = data.Dimmer;
                 }
-                if (data.Dimmer !== undefined) document.getElementById('dimmerSlider').value = data.Dimmer;
             } catch (e) { appendConsole(event.data); }
         };
     }
@@ -338,7 +340,7 @@ void applyDimmer() {
   if (!triacState || dimmerValue == 0) {
     digitalWrite(TriacPin, LOW);
   }
-  portEXIT_CRITICAL_ISR(&dimmerMux);
+  portEXIT_CRITICAL(&dimmerMux);
 }
 
 void setDimmerLevel(uint8_t val) {
@@ -350,6 +352,8 @@ void setDimmerLevel(uint8_t val) {
   preferences.putUChar("dimmer", dimmerValue);
   preferences.putUChar("triacState", triacState ? 1 : 0);
   preferences.end();
+  
+  logMessage(">> Dimmer set to: " + String(dimmerValue));
   broadcastState(); 
 }
 
@@ -361,6 +365,7 @@ void triacOn() {
   preferences.putUChar("dimmer", dimmerValue);
   preferences.putUChar("triacState", 1);
   preferences.end();
+  logMessage(">> Dimmer set to: " + String(dimmerValue));
   broadcastState();
 }
 
@@ -372,6 +377,7 @@ void triacOff() {
   preferences.putUChar("dimmer", dimmerValue);
   preferences.putUChar("triacState", 0);
   preferences.end();
+  logMessage(">> Dimmer set to: 0");
   broadcastState();
 }
 
@@ -409,12 +415,10 @@ void ir_remote() {
         case IR_All_Off: 
           for(int i=1; i<=4; i++) setRelayState(i, false);
           triacOff();
-          broadcastState();
           break;
         case IR_All_On: 
           for(int i=1; i<=4; i++) setRelayState(i, true);
           setDimmerLevel(DIMMER_MAX);
-          broadcastState();
           break;
         default: break;
       }
@@ -435,11 +439,12 @@ void setRelayState(int relay, bool turnOn) {
         default: return;
     }
     relayStates[relay - 1] = turnOn;
-    digitalWrite(pin, turnOn ? LOW : HIGH); // Low = Relay ON (for active-low modules)
+    digitalWrite(pin, turnOn ? LOW : HIGH); // Low = Relay ON (active-low)
 
     preferences.begin("config", false);
     preferences.putUChar(prefKey.c_str(), turnOn ? 1 : 0);
     preferences.end();
+    
     logMessage(">> Relay " + String(relay) + " -> " + (turnOn ? "ON" : "OFF"));
     broadcastState(); 
 }
@@ -661,23 +666,27 @@ void handleCommand(const String& cmd) {
         dimm_Dn();
         return;
     } else if (trimmedCmd == "ALL_ON") {
-        for (int i = 1; i <= 4; i++) setRelayState(i, true);
+        for (int i = 1; i <= 4; i++) relayStates[i - 1] = true;
         setDimmerLevel(DIMMER_MAX);
         return;
     } else if (trimmedCmd == "ALL_OFF") {
-        for (int i = 1; i <= 4; i++) setRelayState(i, false);
+        for (int i = 1; i <= 4; i++) relayStates[i - 1] = false;
         setDimmerLevel(DIMMER_MIN);
         return;
     } else if (trimmedCmd == "STATUS") {
         logMessage(">> [STATUS REQUEST] Refreshing States...");
         broadcastState();
+        logMessage("-> Relay 1: " + String(relayStates[0] ? "ON" : "OFF"));
+        logMessage("-> Relay 2: " + String(relayStates[1] ? "ON" : "OFF"));
+        logMessage("-> Fan Dimmer Level: " + String(dimmerValue) + " (Triac: " + String(triacState ? "ON" : "OFF") + ")");
+        logMessage("-> MQTT Status: " + String(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED"));
         return;
     }
 
     broadcastState();
 }
 
-// --- Instant State Broadcast (Matches ESP8266 Schema & Log Output) ---
+// --- Instant State Broadcast ---
 void broadcastState() {
     JsonDocument doc;
     doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
@@ -689,15 +698,12 @@ void broadcastState() {
     String out;
     serializeJson(doc, out);
 
-    // Broadcast over WebSocket to WebUI
     webSocket.broadcastTXT(out);
 
-    // Echo to MQTT Broker
     if (mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
 
-    // Sends to both Serial Terminal AND WebUI console box matching ESP8266 behavior
     logMessage(">> STATE BROADCAST: " + out);
 }
 

@@ -41,12 +41,12 @@ const int ZeroCrossPin = 34;
 const int IR_RECV_PIN = 35;     
 const int CONFIG_BUTTON_PIN = 0;
 
-#define SwitchPin1 D13
-#define SwitchPin2 D12
-#define SwitchPin3 D14
-#define SwitchPin4 D27
-#define SwitchPin5 D32
-#define SwitchPin6 D33
+#define SwitchPin1 13
+#define SwitchPin2 12
+#define SwitchPin3 14
+#define SwitchPin4 27
+#define SwitchPin5 32
+#define SwitchPin6 33
 
 AceButton button1(SwitchPin1);
 AceButton button2(SwitchPin2);

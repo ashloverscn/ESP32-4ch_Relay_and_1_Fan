@@ -13,6 +13,7 @@ using namespace ace_button;
 
 Preferences preferences;
 
+// --- Default Fallback Credentials ---
 const char* DEFAULT_SSID = "ash_jio_2G";
 const char* DEFAULT_PASSWORD = "ThundersnO0w@,,#";
 
@@ -23,6 +24,7 @@ const char* DEFAULT_MQTT_PASS = "admin1234S";
 const char* DEFAULT_MQTT_TOPIC_CMD = "home/esp32/command";
 const char* DEFAULT_MQTT_TOPIC_STATE = "home/esp32/state";
 
+// --- Runtime Configuration Variables ---
 String stored_ssid;
 String stored_password;
 String mqtt_server;
@@ -32,21 +34,23 @@ String mqtt_pass;
 String mqtt_topic_cmd;
 String mqtt_topic_state;
 
-const int RelayPin1 = 23;        
-const int RelayPin2 = 22;        
-const int RelayPin3 = 21;        
-const int RelayPin4 = 19;        
-const int TriacPin  = 18;        
+// --- Pin Assignments ---
+const int RelayPin1    = 23;      
+const int RelayPin2    = 22;      
+const int RelayPin3    = 21;      
+const int RelayPin4    = 19;      
+const int TriacPin     = 18;         
 const int ZeroCrossPin = 34;    
-const int IR_RECV_PIN = 35;     
-const int CONFIG_BUTTON_PIN = 0;
+const int IR_RECV_PIN  = 35;     
+const int CONFIG_BUTTON_PIN = 0; // Boot button for manual AP mode trigger
 
-#define SwitchPin1 13
-#define SwitchPin2 12
-#define SwitchPin3 14
-#define SwitchPin4 27
-#define SwitchPin5 32
-#define SwitchPin6 33
+// --- Wall Switch / Button Pins (AceButton) ---
+#define SwitchPin1 13 // Relay 1 Toggle
+#define SwitchPin2 12 // Relay 2 Toggle
+#define SwitchPin3 14 // Relay 3 Toggle
+#define SwitchPin4 27 // Relay 4 Toggle
+#define SwitchPin5 32 // Dimmer Down / Fan Off
+#define SwitchPin6 33 // Dimmer Up / Fan On
 
 AceButton button1(SwitchPin1);
 AceButton button2(SwitchPin2);
@@ -55,6 +59,7 @@ AceButton button4(SwitchPin4);
 AceButton button5(SwitchPin5);
 AceButton button6(SwitchPin6);
 
+// --- IR Remote Hex Codes (Adjust to match your specific remote) ---
 #define IR_Button_1    0xF50A7F80
 #define IR_Button_2    0xE41B7F80
 #define IR_Button_3    0xE01F7F80
@@ -65,6 +70,7 @@ AceButton button6(SwitchPin6);
 #define IR_All_Off     0xE11E7F80
 #define IR_All_On      0xED127F80
 
+// --- Phase Control Timing Map (Microseconds from Zero-Cross) ---
 const uint32_t spd[10] = {
   9500, 
   8500, 
@@ -81,32 +87,33 @@ const uint32_t spd[10] = {
 #define DIMMER_MIN 0
 #define DIMMER_MAX 9
 
+// --- Controller State ---
 bool relayStates[4] = {false, false, false, false};
 uint8_t dimmerValue = 0; 
 volatile bool triacState = false;
 
+// --- ESP32 Hardware Timer for Dimmer ---
 hw_timer_t *dimmerTimer = NULL;
 portMUX_TYPE dimmerMux = portMUX_INITIALIZER_UNLOCKED;
 
+// --- Web Servers & MQTT ---
 WebServer server(80);
 WebSocketsServer webSocket(81);
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
+// --- Serial & Reconnection State ---
 String serialBuffer = "";
 unsigned long lastCharTime = 0;
 const unsigned long SERIAL_TIMEOUT = 50;
 
 unsigned long lastWiFiCheckTime = 0;
 const unsigned long WIFI_RETRY_INTERVAL = 10000; 
-unsigned long wifiDisconnectedStartTime = 0;        
-const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000;
-
-unsigned long buttonPressStartTime = 0;
-bool buttonStateLast = HIGH;
-const unsigned long LONG_PRESS_DURATION = 3000; 
+unsigned long wifiDisconnectedStartTime = 0;         
+const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; // 10 minutes
 bool apModeActive = false;
 
+// Forward Declarations
 void loadConfig();
 void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState);
 void broadcastState();
@@ -115,11 +122,12 @@ void handleCommand(const String& cmd);
 void setRelayState(int relay, bool turnOn);
 void relayToggle(int relay);
 void setDimmerLevel(uint8_t val);
+void triacOn();
+void triacOff();
 void triacOnOff();
 void dimm_Up();
 void dimm_Dn();
 void ir_remote();
-void processBufferedSerial(const String& data);
 void reconnectMQTT();
 void callbackMQTT(char* topic, byte* payload, unsigned int length);
 void checkWiFiConnection();
@@ -127,13 +135,14 @@ void checkButton();
 void enterAPMode();
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 
+// --- Main Dashboard HTML Template (WebSocket Enabled) ---
 const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 WROOM Home Automation Web Controller</title>
+    <title>ESP32 Multi-Modal Home Automation</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f8; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 650px; background: #ffffff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); position: relative; }
@@ -158,13 +167,13 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <body>
 <div class="container">
     <a href="/config" class="config-link">⚙️ Config</a>
-    <h2>ESP32 WROOM Home Automation</h2>
+    <h2>ESP32 Home Automation</h2>
     <div class="card">
-        <div class="card-title">ESP32 Status</div>
+        <div class="card-title">System Status</div>
         <div id="connectionStatus" class="status-disconnected">Status: Connecting...</div>
     </div>
     <div class="card">
-        <div class="card-title">Relay Controls</div>
+        <div class="card-title">Relay Controls (4-Channel)</div>
         <div class="relay-grid">
             <button id="relay-1" class="relay-btn" onclick="toggleRelay(1)">Relay 1<br>OFF</button>
             <button id="relay-2" class="relay-btn" onclick="toggleRelay(2)">Relay 2<br>OFF</button>
@@ -173,7 +182,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         </div>
     </div>
     <div class="card">
-        <div class="card-title">Dimmer Control (0-9)</div>
+        <div class="card-title">Fan Dimmer Control (0-9)</div>
         <div class="row">
             <button onclick="sendCommand('DIMMER 0')">MIN (0)</button>
             <button onclick="sendCommand('DIMM_DN')">Step -</button>
@@ -183,7 +192,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         </div>
     </div>
     <div class="card">
-        <div class="card-title">Global Commands & Status</div>
+        <div class="card-title">Global Commands</div>
         <div class="row">
             <button class="flex-fill" onclick="sendCommand('ALL_ON')">ALL ON</button>
             <button class="flex-fill" onclick="sendCommand('ALL_OFF')">ALL OFF</button>
@@ -191,7 +200,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         </div>
     </div>
     <div class="card">
-        <div class="card-title">Serial Console / Feedback</div>
+        <div class="card-title">Live Console / Feedback</div>
         <div id="console"></div>
     </div>
 </div>
@@ -222,7 +231,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
     }
     function updateConnectionBanner(connected) {
         const banner = document.getElementById('connectionStatus');
-        banner.innerText = connected ? "Status: Connected (ESP32 Direct)" : "Status: Disconnected";
+        banner.innerText = connected ? "Status: Connected (Live WS)" : "Status: Disconnected";
         banner.className = connected ? "status-connected" : "status-disconnected";
     }
     function toggleRelay(relayNum) { sendCommand(`POWER${relayNum} ${relayStates[relayNum - 1] ? 'OFF' : 'ON'}`); }
@@ -245,6 +254,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// --- Configuration Portal HTML Template ---
 const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -298,6 +308,7 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// --- Hardware Timer & Interrupt Handlers for AC Dimming ---
 void IRAM_ATTR onDimmerTimer() {
   portENTER_CRITICAL_ISR(&dimmerMux);
   digitalWrite(TriacPin, HIGH);
@@ -334,6 +345,7 @@ void setDimmerLevel(uint8_t val) {
   preferences.putUChar("triacState", triacState ? 1 : 0);
   preferences.end();
   broadcastState();
+  logMessage(">> Dimmer set to: " + String(dimmerValue));
 }
 
 void triacOn() {
@@ -375,32 +387,20 @@ void dimm_Dn() {
   setDimmerLevel(dimmerValue);
 }
 
+// --- IR Remote Decoder ---
 void ir_remote() {
   if (IrReceiver.decode()) {
     if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
       uint32_t code = IrReceiver.decodedIRData.decodedRawData;
+      logMessage(">> IR Code Received: 0x" + String(code, HEX));
       switch (code) {
-        case IR_Button_1: 
-          relayToggle(1); 
-          break;
-        case IR_Button_2: 
-          relayToggle(2); 
-          break;
-        case IR_Button_3: 
-          relayToggle(3); 
-          break;
-        case IR_Button_4: 
-          relayToggle(4); 
-          break;
-        case IR_Button_5: 
-          triacOnOff(); 
-          break;
-        case IR_Button_Up: 
-          dimm_Up(); 
-          break;
-        case IR_Button_Dn: 
-          dimm_Dn(); 
-          break;
+        case IR_Button_1: relayToggle(1); break;
+        case IR_Button_2: relayToggle(2); break;
+        case IR_Button_3: relayToggle(3); break;
+        case IR_Button_4: relayToggle(4); break;
+        case IR_Button_5: triacOnOff(); break;
+        case IR_Button_Up: dimm_Up(); break;
+        case IR_Button_Dn: dimm_Dn(); break;
         case IR_All_Off: 
           for(int i=1; i<=4; i++) setRelayState(i, false);
           triacOff();
@@ -418,6 +418,7 @@ void ir_remote() {
   }
 }
 
+// --- Relay Control ---
 void setRelayState(int relay, bool turnOn) {
     int pin = 0;
     String prefKey = "";
@@ -429,11 +430,12 @@ void setRelayState(int relay, bool turnOn) {
         default: return;
     }
     relayStates[relay - 1] = turnOn;
-    digitalWrite(pin, turnOn ? LOW : HIGH);
+    digitalWrite(pin, turnOn ? LOW : HIGH); // Low = Relay ON (for active-low modules)
 
     preferences.begin("config", false);
     preferences.putUChar(prefKey.c_str(), turnOn ? 1 : 0);
     preferences.end();
+    logMessage(">> Relay " + String(relay) + " -> " + (turnOn ? "ON" : "OFF"));
 }
 
 void relayToggle(int relay) {
@@ -450,6 +452,7 @@ void relayToggle(int relay) {
     broadcastState();
 }
 
+// --- Preferences Storage Helpers ---
 void loadConfig() {
     preferences.begin("config", false);
     stored_ssid = preferences.getString("ssid", DEFAULT_SSID);
@@ -501,6 +504,7 @@ void logMessage(const String& msg) {
     webSocket.broadcastTXT(output);
 }
 
+// --- Wi-Fi & Connection Management ---
 void checkWiFiConnection() {
     if (!apModeActive) {
         if (WiFi.status() == WL_CONNECTED) {
@@ -511,7 +515,7 @@ void checkWiFiConnection() {
                 logMessage(">> WiFi lost. Starting 10-minute AP fallback timer...");
             } 
             else if (millis() - wifiDisconnectedStartTime >= WIFI_AP_FALLBACK_TIMEOUT) {
-                logMessage(">> WiFi reconnection timed out (10 mins exceeded). Entering AP Mode automatically...");
+                logMessage(">> WiFi reconnection timed out. Entering AP Mode automatically...");
                 enterAPMode();
                 return;
             }
@@ -528,19 +532,18 @@ void checkWiFiConnection() {
 }
 
 void checkButton() {
-    int currentState = digitalRead(CONFIG_BUTTON_PIN);
-    if (currentState == LOW && buttonStateLast == HIGH) {
-        buttonPressStartTime = millis();
-        buttonStateLast = LOW;
-    } 
-    else if (currentState == LOW && buttonStateLast == LOW) {
-        if (!apModeActive && (millis() - buttonPressStartTime >= LONG_PRESS_DURATION)) {
-            logMessage(">> Long press detected on GPIO 0! Entering AP Configuration Mode...");
-            enterAPMode();
+    if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+        delay(50);
+        if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+            unsigned long pressTime = millis();
+            while (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+                if (millis() - pressTime > 3000) {
+                    logMessage(">> Long press on GPIO 0 detected! Entering AP Setup Mode...");
+                    enterAPMode();
+                    return;
+                }
+            }
         }
-    } 
-    else if (currentState == HIGH && buttonStateLast == LOW) {
-        buttonStateLast = HIGH;
     }
 }
 
@@ -551,7 +554,7 @@ void enterAPMode() {
     
     bool apStarted = WiFi.softAP("ESP32-Setup-AP", "12345678");
     if (apStarted) {
-        logMessage(">> AP Mode Started Successfully! SSID: ESP32-Setup-AP | IP: http://192.168.4.1");
+        logMessage(">> AP Mode Started! SSID: ESP32-Setup-AP | IP: http://192.168.4.1");
     }
 
     webSocket.close();
@@ -585,6 +588,7 @@ void enterAPMode() {
     server.begin();
 }
 
+// --- WebSocket Event Handler ---
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
     if (type == WStype_CONNECTED) broadcastState();
     else if (type == WStype_TEXT) {
@@ -595,6 +599,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     }
 }
 
+// --- MQTT Callbacks & Reconnection ---
 void callbackMQTT(char* topic, byte* payload, unsigned int length) {
     String message;
     for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
@@ -619,11 +624,13 @@ void reconnectMQTT() {
             String clientId = "ESP32Gateway-" + String((uint32_t)ESP.getEfuseMac(), HEX);
             if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
                 mqttClient.subscribe(mqtt_topic_cmd.c_str());
+                logMessage(">> MQTT Connected & Subscribed!");
             }
         }
     }
 }
 
+// --- Unified Command Dispatcher ---
 void handleCommand(const String& cmd) {
     String trimmedCmd = cmd;
     trimmedCmd.trim();
@@ -658,31 +665,22 @@ void handleCommand(const String& cmd) {
     } else if (trimmedCmd == "ALL_ON") {
         for (int i = 1; i <= 4; i++) setRelayState(i, true);
         setDimmerLevel(DIMMER_MAX);
+        broadcastState();
         return;
     } else if (trimmedCmd == "ALL_OFF") {
         for (int i = 1; i <= 4; i++) setRelayState(i, false);
         setDimmerLevel(DIMMER_MIN);
+        broadcastState();
+        return;
+    } else if (trimmedCmd == "STATUS") {
+        broadcastState();
         return;
     }
 
     broadcastState();
 }
 
-void processBufferedSerial(const String& data) {
-    String bufferCopy = data;
-    bufferCopy.trim();
-    if (bufferCopy.length() == 0) return;
-    int startIdx = 0;
-    while (startIdx < (int)bufferCopy.length()) {
-        int nextNewline = bufferCopy.indexOf('\n', startIdx);
-        if (nextNewline == -1) nextNewline = bufferCopy.length();
-        String line = bufferCopy.substring(startIdx, nextNewline);
-        line.trim();
-        if (line.length() > 0) handleCommand(line);
-        startIdx = nextNewline + 1;
-    }
-}
-
+// --- State Broadcast (WebSockets + MQTT) ---
 void broadcastState() {
     JsonDocument doc;
     doc["type"] = "state_update";
@@ -699,6 +697,7 @@ void broadcastState() {
     }
 }
 
+// --- AceButton Event Handler (Wall Switches) ---
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
   uint8_t pin = button->getPin();
 
@@ -719,6 +718,7 @@ void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
   }
 }
 
+// --- Setup ---
 void setup() {
     Serial.begin(115200);
     delay(1000);
@@ -740,6 +740,7 @@ void setup() {
     pinMode(SwitchPin5, INPUT_PULLUP);
     pinMode(SwitchPin6, INPUT_PULLUP);
 
+    // Initialize AceButton configurations
     ButtonConfig* config1 = button1.getButtonConfig();
     config1->setEventHandler(handleEvent);
     config1->setFeature(ButtonConfig::kFeatureClick);
@@ -770,14 +771,17 @@ void setup() {
 
     loadConfig();
 
+    // Setup ESP32 Hardware Timer for Dimmer
     dimmerTimer = timerBegin(1000000);
     if (dimmerTimer) {
       timerAttachInterrupt(dimmerTimer, &onDimmerTimer);
       attachInterrupt(digitalPinToInterrupt(ZeroCrossPin), onZeroCross, CHANGE);
     }
 
+    // Initialize IR Receiver
     IrReceiver.begin(IR_RECV_PIN, ENABLE_LED_FEEDBACK);
 
+    // Connect to Wi-Fi
     WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
     unsigned long startAttempt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
@@ -789,6 +793,7 @@ void setup() {
     mqttClient.setCallback(callbackMQTT);
     mqttClient.setBufferSize(512);
 
+    // Setup HTTP Endpoints
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", HTML_TEMPLATE); });
     server.on("/config", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
     server.on("/get-config", HTTP_GET, []() {
@@ -821,6 +826,7 @@ void setup() {
     webSocket.onEvent(webSocketEvent);
 }
 
+// --- Main Loop ---
 void loop() {
     checkButton();
 
@@ -839,8 +845,10 @@ void loop() {
     webSocket.loop();
     server.handleClient();
 
+    // Check IR Remote Inputs
     ir_remote();
 
+    // Check Physical Button States (AceButton)
     button1.check();
     button2.check();
     button3.check();
@@ -848,6 +856,7 @@ void loop() {
     button5.check();
     button6.check();
 
+    // Process Serial Command Inputs
     while (Serial.available()) {
         char c = Serial.read();
         lastCharTime = millis();
@@ -856,7 +865,8 @@ void loop() {
     }
 
     if (serialBuffer.length() > 0 && (millis() - lastCharTime >= SERIAL_TIMEOUT)) {
-        processBufferedSerial(serialBuffer);
+        serialBuffer.trim();
+        handleCommand(serialBuffer);
         serialBuffer = "";
     }
 }

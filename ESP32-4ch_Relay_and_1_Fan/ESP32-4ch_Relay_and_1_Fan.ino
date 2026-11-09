@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -99,9 +98,8 @@ auto timer = timer_create_default();
 hw_timer_t *dimmerTimer = NULL;
 portMUX_TYPE dimmerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- Web Servers & MQTT ---
+// --- Web Server & MQTT (No WebSockets) ---
 WebServer server(80);
-WebSocketsServer webSocket(81);
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
@@ -138,15 +136,16 @@ void checkButton();
 void enterAPMode();
 bool sendPeriodicStatus(void*);
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
+String getStateJSON();
 
-// --- Main Dashboard HTML Template ---
+// --- Main Dashboard HTML Template (HTTP Short-Polling) ---
 const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32 Multi-Modal Home Automation</title>
+    <title>ESP32 Home Automation</title>
     <style>
         body { font-family: Arial, sans-serif; background-color: #f4f6f8; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 650px; background: #ffffff; border-radius: 8px; padding: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); position: relative; }
@@ -209,54 +208,76 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
     </div>
 </div>
 <script>
-    let ws;
     let relayStates = [false, false, false, false];
-    let reconnectAttempts = 0;
-    function initWebSocket() {
-        ws = new WebSocket('ws://' + window.location.hostname + ':81/');
-        ws.onopen = () => { reconnectAttempts = 0; updateConnectionBanner(true); appendConsole("Connected to ESP32 WebSocket server."); sendCommand('STATUS'); };
-        ws.onclose = () => {
-            updateConnectionBanner(false);
-            let timeout = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 10000);
-            appendConsole(`Disconnected. Reconnecting in ${Math.round(timeout/1000)}s...`);
-            setTimeout(initWebSocket, timeout);
-            reconnectAttempts++;
-        };
-        ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                if (data.type === 'console_log') {
-                    appendConsole(data.message);
-                } else if (data.POWER1 !== undefined) {
+
+    function pollState() {
+        fetch('/status-json')
+            .then(res => res.json())
+            .then(data => {
+                updateConnectionBanner(true);
+                if (data.POWER1 !== undefined) {
                     updateRelayUI(1, data.POWER1 === 'ON');
                     updateRelayUI(2, data.POWER2 === 'ON');
                     updateRelayUI(3, data.POWER3 === 'ON');
                     updateRelayUI(4, data.POWER4 === 'ON');
-                    if (data.Dimmer !== undefined) document.getElementById('dimmerSlider').value = data.Dimmer;
+                    if (data.Dimmer !== undefined) {
+                        document.getElementById('dimmerSlider').value = data.Dimmer;
+                    }
                 }
-            } catch (e) { appendConsole(event.data); }
-        };
+            })
+            .catch(err => {
+                updateConnectionBanner(false);
+            });
     }
+
     function updateConnectionBanner(connected) {
         const banner = document.getElementById('connectionStatus');
         banner.innerText = connected ? "Status: Connected" : "Status: Disconnected";
         banner.className = connected ? "status-connected" : "status-disconnected";
     }
-    function toggleRelay(relayNum) { sendCommand(`POWER${relayNum} ${relayStates[relayNum - 1] ? 'OFF' : 'ON'}`); }
-    function onSliderChange(val) { sendCommand(`DIMMER ${val}`); }
-    function sendCommand(cmd) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({command: cmd})); }
+
+    function toggleRelay(relayNum) { 
+        sendCommand(`POWER${relayNum} ${relayStates[relayNum - 1] ? 'OFF' : 'ON'}`); 
+    }
+
+    function onSliderChange(val) { 
+        sendCommand(`DIMMER ${val}`); 
+    }
+
+    function sendCommand(cmd) {
+        fetch(`/cmd?action=${encodeURIComponent(cmd)}`)
+            .then(res => res.json())
+            .then(data => {
+                appendConsole(`>> Sent: ${cmd}`);
+                if (data.POWER1 !== undefined) {
+                    updateRelayUI(1, data.POWER1 === 'ON');
+                    updateRelayUI(2, data.POWER2 === 'ON');
+                    updateRelayUI(3, data.POWER3 === 'ON');
+                    updateRelayUI(4, data.POWER4 === 'ON');
+                    if (data.Dimmer !== undefined) {
+                        document.getElementById('dimmerSlider').value = data.Dimmer;
+                    }
+                }
+            })
+            .catch(err => appendConsole(`Command error: ${cmd}`));
+    }
+
     function updateRelayUI(relayNum, isOn) {
         relayStates[relayNum - 1] = isOn;
         const btn = document.getElementById(`relay-${relayNum}`);
         btn.innerText = `Relay ${relayNum}\n${isOn ? 'ON' : 'OFF'}`;
         if (isOn) btn.classList.add('on'); else btn.classList.remove('on');
     }
+
     function appendConsole(msg) {
         const consoleEl = document.getElementById('console');
         consoleEl.innerHTML += msg + '\n';
         consoleEl.scrollTop = consoleEl.scrollHeight;
     }
-    window.onload = initWebSocket;
+
+    // Start short-polling every 3 seconds
+    setInterval(pollState, 3000);
+    window.onload = pollState;
 </script>
 </body>
 </html>
@@ -506,12 +527,19 @@ void saveConfig(String ssid, String pass, String srv, int prt, String usr, Strin
 
 void logMessage(const String& msg) {
     Serial.println(msg);
+}
+
+// --- State JSON Helper ---
+String getStateJSON() {
     JsonDocument doc;
-    doc["type"] = "console_log";
-    doc["message"] = msg;
+    doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
+    doc["POWER2"] = relayStates[1] ? "ON" : "OFF";
+    doc["POWER3"] = relayStates[2] ? "ON" : "OFF";
+    doc["POWER4"] = relayStates[3] ? "ON" : "OFF";
+    doc["Dimmer"] = dimmerValue;
     String output;
     serializeJson(doc, output);
-    webSocket.broadcastTXT(output);
+    return output;
 }
 
 // --- Wi-Fi & Connection Management ---
@@ -567,7 +595,6 @@ void enterAPMode() {
         logMessage(">> AP Mode Started! SSID: ESP32-Setup-AP | IP: http://192.168.4.1");
     }
 
-    webSocket.close();
     server.stop();
 
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
@@ -596,17 +623,6 @@ void enterAPMode() {
         ESP.restart();
     });
     server.begin();
-}
-
-// --- WebSocket Event Handler ---
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-    if (type == WStype_CONNECTED) broadcastState();
-    else if (type == WStype_TEXT) {
-        JsonDocument doc;
-        if (!deserializeJson(doc, payload, length) && doc.containsKey("command")) {
-            handleCommand(doc["command"].as<String>());
-        }
-    }
 }
 
 // --- MQTT Callbacks & Reconnection ---
@@ -686,24 +702,12 @@ void handleCommand(const String& cmd) {
     broadcastState();
 }
 
-// --- Instant State Broadcast ---
+// --- State Broadcast (MQTT & Serial) ---
 void broadcastState() {
-    JsonDocument doc;
-    doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
-    doc["POWER2"] = relayStates[1] ? "ON" : "OFF";
-    doc["POWER3"] = relayStates[2] ? "ON" : "OFF";
-    doc["POWER4"] = relayStates[3] ? "ON" : "OFF";
-    doc["Dimmer"] = dimmerValue;
-
-    String out;
-    serializeJson(doc, out);
-
-    webSocket.broadcastTXT(out);
-
+    String out = getStateJSON();
     if (mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
-
     logMessage(">> STATE BROADCAST: " + out);
 }
 
@@ -815,9 +819,16 @@ void setup() {
     mqttClient.setCallback(callbackMQTT);
     mqttClient.setBufferSize(512);
 
-    // Setup HTTP Endpoints
+    // Setup HTTP Endpoints (Dashboard, Polling, REST Commands & Config)
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", HTML_TEMPLATE); });
     server.on("/config", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
+    server.on("/status-json", HTTP_GET, []() { server.send(200, "application/json", getStateJSON()); });
+    server.on("/cmd", HTTP_GET, []() {
+        if (server.hasArg("action")) {
+            handleCommand(server.arg("action"));
+        }
+        server.send(200, "application/json", getStateJSON());
+    });
     server.on("/get-config", HTTP_GET, []() {
         JsonDocument doc;
         doc["ssid"] = stored_ssid; doc["pass_wifi"] = stored_password;
@@ -844,9 +855,6 @@ void setup() {
     });
     server.begin();
 
-    webSocket.begin();
-    webSocket.onEvent(webSocketEvent);
-
     timer.every(10000, sendPeriodicStatus);
 }
 
@@ -866,7 +874,6 @@ void loop() {
     }
     mqttClient.loop();
 
-    webSocket.loop();
     server.handleClient();
 
     timer.tick();

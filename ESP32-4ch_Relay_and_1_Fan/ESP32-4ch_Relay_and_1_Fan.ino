@@ -98,7 +98,7 @@ auto timer = timer_create_default();
 hw_timer_t *dimmerTimer = NULL;
 portMUX_TYPE dimmerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- Web Server & MQTT (No WebSockets) ---
+// --- Web Server & MQTT ---
 WebServer server(80);
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
@@ -138,7 +138,7 @@ bool sendPeriodicStatus(void*);
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 String getStateJSON();
 
-// --- Main Dashboard HTML Template (HTTP Short-Polling) ---
+// --- Main Dashboard HTML Template with 4-Channel Support ---
 const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -160,7 +160,7 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         .relay-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
         .relay-btn { height: 70px; font-weight: bold; background-color: #e0e0e0; color: #000; border-radius: 6px; }
         .relay-btn.on { background-color: #4CAF50; color: #fff; }
-        #console { width: 100%; height: 150px; background-color: #1e1e1e; color: #00ff00; font-family: monospace; font-size: 12px; padding: 10px; box-sizing: border-box; overflow-y: scroll; border-radius: 4px; white-space: pre-wrap; }
+        #console { width: 100%; height: 180px; background-color: #1e1e1e; color: #00ff00; font-family: monospace; font-size: 12px; padding: 10px; box-sizing: border-box; overflow-y: scroll; border-radius: 4px; white-space: pre-wrap; }
         .flex-fill { flex: 1; }
         #connectionStatus { font-weight: bold; padding: 5px 10px; border-radius: 4px; display: inline-block; }
         .status-disconnected { background: #ffebee; color: #c62828; }
@@ -230,6 +230,18 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
             });
     }
 
+    function pollLogs() {
+        fetch('/logs')
+            .then(res => res.text())
+            .then(logText => {
+                if (logText.trim().length > 0) {
+                    const consoleEl = document.getElementById('console');
+                    consoleEl.innerHTML += logText;
+                    consoleEl.scrollTop = consoleEl.scrollHeight;
+                }
+            }).catch(e => {});
+    }
+
     function updateConnectionBanner(connected) {
         const banner = document.getElementById('connectionStatus');
         banner.innerText = connected ? "Status: Connected" : "Status: Disconnected";
@@ -248,7 +260,6 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         fetch(`/cmd?action=${encodeURIComponent(cmd)}`)
             .then(res => res.json())
             .then(data => {
-                appendConsole(`>> Sent: ${cmd}`);
                 if (data.POWER1 !== undefined) {
                     updateRelayUI(1, data.POWER1 === 'ON');
                     updateRelayUI(2, data.POWER2 === 'ON');
@@ -259,24 +270,20 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
                     }
                 }
             })
-            .catch(err => appendConsole(`Command error: ${cmd}`));
+            .catch(err => {});
     }
 
     function updateRelayUI(relayNum, isOn) {
         relayStates[relayNum - 1] = isOn;
         const btn = document.getElementById(`relay-${relayNum}`);
-        btn.innerText = `Relay ${relayNum}\n${isOn ? 'ON' : 'OFF'}`;
-        if (isOn) btn.classList.add('on'); else btn.classList.remove('on');
+        if (btn) {
+            btn.innerText = `Relay ${relayNum}\n${isOn ? 'ON' : 'OFF'}`;
+            if (isOn) btn.classList.add('on'); else btn.classList.remove('on');
+        }
     }
 
-    function appendConsole(msg) {
-        const consoleEl = document.getElementById('console');
-        consoleEl.innerHTML += msg + '\n';
-        consoleEl.scrollTop = consoleEl.scrollHeight;
-    }
-
-    // Start short-polling every 3 seconds
     setInterval(pollState, 3000);
+    setInterval(pollLogs, 1000);
     window.onload = pollState;
 </script>
 </body>
@@ -337,6 +344,17 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
+// --- Ring Buffer for Web Console Real-Time Log Streaming ---
+String webLogBuffer = "";
+
+void logMessage(const String& msg) {
+    Serial.println(msg);
+    webLogBuffer += msg + "\n";
+    if (webLogBuffer.length() > 2048) {
+        webLogBuffer = webLogBuffer.substring(webLogBuffer.length() - 1536);
+    }
+}
+
 // --- Hardware Timer & Interrupt Handlers for AC Dimming ---
 void IRAM_ATTR onDimmerTimer() {
   portENTER_CRITICAL_ISR(&dimmerMux);
@@ -369,6 +387,7 @@ void setDimmerLevel(uint8_t val) {
   dimmerValue = val;
   triacState = (dimmerValue > 0);
   applyDimmer();
+  
   preferences.begin("config", false);
   preferences.putUChar("dimmer", dimmerValue);
   preferences.putUChar("triacState", triacState ? 1 : 0);
@@ -519,17 +538,13 @@ void saveConfig(String ssid, String pass, String srv, int prt, String usr, Strin
     preferences.putString("server", srv);
     preferences.putInt("port", prt);
     preferences.putString("user", usr);
-    preferences.putString("pwd", pwd);
+    preferences.putString("pass", pwd);
     preferences.putString("tcmd", tCmd);
     preferences.putString("tstate", tState);
     preferences.end();
 }
 
-void logMessage(const String& msg) {
-    Serial.println(msg);
-}
-
-// --- State JSON Helper ---
+// --- State JSON Helper (All 4 Relays Included) ---
 String getStateJSON() {
     JsonDocument doc;
     doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
@@ -694,7 +709,9 @@ void handleCommand(const String& cmd) {
         broadcastState();
         logMessage("-> Relay 1: " + String(relayStates[0] ? "ON" : "OFF"));
         logMessage("-> Relay 2: " + String(relayStates[1] ? "ON" : "OFF"));
-        logMessage("-> Fan Dimmer Level: " + String(dimmerValue) + " (Triac: " + String(triacState ? "ON" : "OFF") + ")");
+        logMessage("-> Relay 3: " + String(relayStates[2] ? "ON" : "OFF"));
+        logMessage("-> Relay 4: " + String(relayStates[3] ? "ON" : "OFF"));
+        logMessage("-> Fan Dimmer Level: " + String(dimmerValue) + " (Triac: " + String(triacState ? "ACTIVE" : "INACTIVE") + ")");
         logMessage("-> MQTT Status: " + String(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED"));
         return;
     }
@@ -702,7 +719,7 @@ void handleCommand(const String& cmd) {
     broadcastState();
 }
 
-// --- State Broadcast (MQTT & Serial) ---
+// --- State Broadcast ---
 void broadcastState() {
     String out = getStateJSON();
     if (mqttClient.connected()) {
@@ -716,7 +733,7 @@ bool sendPeriodicStatus(void*) {
     return true;
 }
 
-// --- AceButton Event Handler (Wall Switches) ---
+// --- AceButton Event Handler ---
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
   uint8_t pin = button->getPin();
 
@@ -759,7 +776,6 @@ void setup() {
     pinMode(SwitchPin5, INPUT_PULLUP);
     pinMode(SwitchPin6, INPUT_PULLUP);
 
-    // Initialize AceButton configurations
     ButtonConfig* config1 = button1.getButtonConfig();
     config1->setEventHandler(handleEvent);
     config1->setFeature(ButtonConfig::kFeatureClick);
@@ -790,17 +806,14 @@ void setup() {
 
     loadConfig();
 
-    // Setup ESP32 Hardware Timer for Dimmer
     dimmerTimer = timerBegin(1000000);
     if (dimmerTimer) {
       timerAttachInterrupt(dimmerTimer, &onDimmerTimer);
       attachInterrupt(digitalPinToInterrupt(ZeroCrossPin), onZeroCross, CHANGE);
     }
 
-    // Initialize IR Receiver
     IrReceiver.begin(IR_RECV_PIN, ENABLE_LED_FEEDBACK);
 
-    // Connect to Wi-Fi
     WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
     unsigned long startAttempt = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
@@ -819,10 +832,13 @@ void setup() {
     mqttClient.setCallback(callbackMQTT);
     mqttClient.setBufferSize(512);
 
-    // Setup HTTP Endpoints (Dashboard, Polling, REST Commands & Config)
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", HTML_TEMPLATE); });
     server.on("/config", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
     server.on("/status-json", HTTP_GET, []() { server.send(200, "application/json", getStateJSON()); });
+    server.on("/logs", HTTP_GET, []() {
+        server.send(200, "text/plain", webLogBuffer);
+        webLogBuffer = ""; // clear buffer after retrieval
+    });
     server.on("/cmd", HTTP_GET, []() {
         if (server.hasArg("action")) {
             handleCommand(server.arg("action"));
@@ -878,10 +894,8 @@ void loop() {
 
     timer.tick();
 
-    // Check IR Remote Inputs
     ir_remote();
 
-    // Check Physical Button States (AceButton)
     button1.check();
     button2.check();
     button3.check();
@@ -889,7 +903,6 @@ void loop() {
     button5.check();
     button6.check();
 
-    // Process Serial Command Inputs
     while (Serial.available()) {
         char c = Serial.read();
         lastCharTime = millis();

@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -35,11 +36,11 @@ String mqtt_topic_cmd;
 String mqtt_topic_state;
 
 // --- Pin Assignments ---
-const int RelayPin1    = 23;      
-const int RelayPin2    = 22;      
-const int RelayPin3    = 21;      
-const int RelayPin4    = 19;      
-const int TriacPin     = 18;         
+const int RelayPin1     = 23;      
+const int RelayPin2     = 22;      
+const int RelayPin3     = 21;      
+const int RelayPin4     = 19;      
+const int TriacPin      = 18;          
 const int ZeroCrossPin = 34;    
 const int IR_RECV_PIN  = 35;     
 const int CONFIG_BUTTON_PIN = 0; // Boot button for manual AP mode trigger
@@ -98,8 +99,9 @@ auto timer = timer_create_default();
 hw_timer_t *dimmerTimer = NULL;
 portMUX_TYPE dimmerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- Web Server & MQTT ---
+// --- Web Server, WebSocket & MQTT ---
 WebServer server(80);
+WebSocketsServer webSocket(81);
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
@@ -137,8 +139,9 @@ void enterAPMode();
 bool sendPeriodicStatus(void*);
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 String getStateJSON();
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 
-// --- Main Dashboard HTML Template with 4-Channel Support ---
+// --- Main Dashboard HTML Template with WebSocket Client ---
 const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -208,38 +211,46 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
     </div>
 </div>
 <script>
+    let ws;
     let relayStates = [false, false, false, false];
+    let reconnectAttempts = 0;
 
-    function pollState() {
-        fetch('/status-json')
-            .then(res => res.json())
-            .then(data => {
-                updateConnectionBanner(true);
-                if (data.POWER1 !== undefined) {
-                    updateRelayUI(1, data.POWER1 === 'ON');
-                    updateRelayUI(2, data.POWER2 === 'ON');
-                    updateRelayUI(3, data.POWER3 === 'ON');
-                    updateRelayUI(4, data.POWER4 === 'ON');
+    function initWebSocket() {
+        ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+        
+        ws.onopen = function(event) {
+            reconnectAttempts = 0;
+            updateConnectionBanner(true);
+            appendConsole("Connected to ESP32 WebSocket server.");
+            sendCommand('STATUS');
+        };
+        
+        ws.onclose = function(event) {
+            updateConnectionBanner(false);
+            let timeout = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 10000);
+            appendConsole(`Disconnected. Reconnecting in ${Math.round(timeout/1000)}s...`);
+            setTimeout(initWebSocket, timeout);
+            reconnectAttempts++;
+        };
+        
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'console_log') {
+                    appendConsole(data.message);
+                } else {
+                    if (data.POWER1 !== undefined) updateRelayUI(1, data.POWER1 === 'ON');
+                    if (data.POWER2 !== undefined) updateRelayUI(2, data.POWER2 === 'ON');
+                    if (data.POWER3 !== undefined) updateRelayUI(3, data.POWER3 === 'ON');
+                    if (data.POWER4 !== undefined) updateRelayUI(4, data.POWER4 === 'ON');
                     if (data.Dimmer !== undefined) {
                         document.getElementById('dimmerSlider').value = data.Dimmer;
                     }
                 }
-            })
-            .catch(err => {
-                updateConnectionBanner(false);
-            });
-    }
-
-    function pollLogs() {
-        fetch('/logs')
-            .then(res => res.text())
-            .then(logText => {
-                if (logText.trim().length > 0) {
-                    const consoleEl = document.getElementById('console');
-                    consoleEl.innerHTML += logText;
-                    consoleEl.scrollTop = consoleEl.scrollHeight;
-                }
-            }).catch(e => {});
+            } catch (e) {
+                appendConsole(event.data);
+            }
+        };
     }
 
     function updateConnectionBanner(connected) {
@@ -257,20 +268,9 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
     }
 
     function sendCommand(cmd) {
-        fetch(`/cmd?action=${encodeURIComponent(cmd)}`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.POWER1 !== undefined) {
-                    updateRelayUI(1, data.POWER1 === 'ON');
-                    updateRelayUI(2, data.POWER2 === 'ON');
-                    updateRelayUI(3, data.POWER3 === 'ON');
-                    updateRelayUI(4, data.POWER4 === 'ON');
-                    if (data.Dimmer !== undefined) {
-                        document.getElementById('dimmerSlider').value = data.Dimmer;
-                    }
-                }
-            })
-            .catch(err => {});
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({command: cmd}));
+        }
     }
 
     function updateRelayUI(relayNum, isOn) {
@@ -282,9 +282,15 @@ const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
         }
     }
 
-    setInterval(pollState, 3000);
-    setInterval(pollLogs, 1000);
-    window.onload = pollState;
+    function appendConsole(msg) {
+        const consoleEl = document.getElementById('console');
+        if (consoleEl) {
+            consoleEl.innerHTML += msg + '\n';
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+    }
+
+    window.onload = initWebSocket;
 </script>
 </body>
 </html>
@@ -344,15 +350,15 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// --- Ring Buffer for Web Console Real-Time Log Streaming ---
-String webLogBuffer = "";
-
+// --- Verbose Console Logger & WebSocket Broadcaster ---
 void logMessage(const String& msg) {
     Serial.println(msg);
-    webLogBuffer += msg + "\n";
-    if (webLogBuffer.length() > 2048) {
-        webLogBuffer = webLogBuffer.substring(webLogBuffer.length() - 1536);
-    }
+    JsonDocument doc;
+    doc["type"] = "console_log";
+    doc["message"] = msg;
+    String output;
+    serializeJson(doc, output);
+    webSocket.broadcastTXT(output);
 }
 
 // --- Hardware Timer & Interrupt Handlers for AC Dimming ---
@@ -610,6 +616,7 @@ void enterAPMode() {
         logMessage(">> AP Mode Started! SSID: ESP32-Setup-AP | IP: http://192.168.4.1");
     }
 
+    webSocket.close();
     server.stop();
 
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
@@ -638,6 +645,28 @@ void enterAPMode() {
         ESP.restart();
     });
     server.begin();
+}
+
+// --- WebSocket Event Callback ---
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            break;
+        case WStype_CONNECTED:
+            Serial.println("STATUS");
+            break;
+        case WStype_TEXT: {
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, payload, length);
+            if (!error && doc.containsKey("command")) {
+                String cmd = doc["command"].as<String>();
+                handleCommand(cmd);
+            }
+            break;
+        }
+        default:
+            break;
+    }
 }
 
 // --- MQTT Callbacks & Reconnection ---
@@ -707,12 +736,6 @@ void handleCommand(const String& cmd) {
     } else if (trimmedCmd == "STATUS") {
         logMessage(">> [STATUS REQUEST] Refreshing States...");
         broadcastState();
-        logMessage("-> Relay 1: " + String(relayStates[0] ? "ON" : "OFF"));
-        logMessage("-> Relay 2: " + String(relayStates[1] ? "ON" : "OFF"));
-        logMessage("-> Relay 3: " + String(relayStates[2] ? "ON" : "OFF"));
-        logMessage("-> Relay 4: " + String(relayStates[3] ? "ON" : "OFF"));
-        logMessage("-> Fan Dimmer Level: " + String(dimmerValue) + " (Triac: " + String(triacState ? "ACTIVE" : "INACTIVE") + ")");
-        logMessage("-> MQTT Status: " + String(mqttClient.connected() ? "CONNECTED" : "DISCONNECTED"));
         return;
     }
 
@@ -725,6 +748,7 @@ void broadcastState() {
     if (mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
+    webSocket.broadcastTXT(out);
     logMessage(">> STATE BROADCAST: " + out);
 }
 
@@ -834,17 +858,6 @@ void setup() {
 
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", HTML_TEMPLATE); });
     server.on("/config", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
-    server.on("/status-json", HTTP_GET, []() { server.send(200, "application/json", getStateJSON()); });
-    server.on("/logs", HTTP_GET, []() {
-        server.send(200, "text/plain", webLogBuffer);
-        webLogBuffer = ""; // clear buffer after retrieval
-    });
-    server.on("/cmd", HTTP_GET, []() {
-        if (server.hasArg("action")) {
-            handleCommand(server.arg("action"));
-        }
-        server.send(200, "application/json", getStateJSON());
-    });
     server.on("/get-config", HTTP_GET, []() {
         JsonDocument doc;
         doc["ssid"] = stored_ssid; doc["pass_wifi"] = stored_password;
@@ -869,9 +882,11 @@ void setup() {
         delay(1000);
         ESP.restart();
     });
+
     server.begin();
 
-    timer.every(10000, sendPeriodicStatus);
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
 }
 
 // --- Main Loop ---
@@ -880,6 +895,12 @@ void loop() {
 
     if (apModeActive) {
         server.handleClient();
+        button1.check();
+        button2.check();
+        button3.check();
+        button4.check();
+        button5.check();
+        button6.check();
         return;
     }
 
@@ -890,11 +911,8 @@ void loop() {
     }
     mqttClient.loop();
 
+    webSocket.loop();
     server.handleClient();
-
-    timer.tick();
-
-    ir_remote();
 
     button1.check();
     button2.check();
@@ -903,11 +921,16 @@ void loop() {
     button5.check();
     button6.check();
 
+    ir_remote();
+
     while (Serial.available()) {
         char c = Serial.read();
         lastCharTime = millis();
-        if (serialBuffer.length() < 512) serialBuffer += c;
-        else serialBuffer = "";
+        if (serialBuffer.length() < 512) {
+            serialBuffer += c;
+        } else {
+            serialBuffer = ""; 
+        }
     }
 
     if (serialBuffer.length() > 0 && (millis() - lastCharTime >= SERIAL_TIMEOUT)) {

@@ -51,7 +51,7 @@ const int RelayPin4         = 19;
 const int TriacPin          = 18;
 const int ZeroCrossPin      = 34;
 const int IR_RECV_PIN       = 35;
-const int BuzzerPin         = 4;
+const int BuzzerPin         = 25;
 const int CONFIG_BUTTON_PIN = 0;
 
 // --- Wall Switch / Button Pins (AceButton) ---

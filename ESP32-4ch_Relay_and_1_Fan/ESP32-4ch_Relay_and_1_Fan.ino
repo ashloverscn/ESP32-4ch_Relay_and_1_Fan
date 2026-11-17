@@ -51,15 +51,15 @@ const int RelayPin4     = 19;
 const int TriacPin      = 18;          
 const int ZeroCrossPin  = 34;    
 const int IR_RECV_PIN   = 35;     
-const int CONFIG_BUTTON_PIN = 0; // Boot button for manual AP mode & factory reset
+const int CONFIG_BUTTON_PIN = 0; 
 
 // --- Wall Switch / Button Pins (AceButton) ---
-#define SwitchPin1 13 // Relay 1 Toggle
-#define SwitchPin2 12 // Relay 2 Toggle
-#define SwitchPin3 14 // Relay 3 Toggle
-#define SwitchPin4 27 // Relay 4 Toggle
-#define SwitchPin5 32 // Dimmer Down / Fan Off
-#define SwitchPin6 33 // Dimmer Up / Fan On
+#define SwitchPin1 13 
+#define SwitchPin2 12 
+#define SwitchPin3 14 
+#define SwitchPin4 27 
+#define SwitchPin5 32 
+#define SwitchPin6 33 
 
 AceButton button1(SwitchPin1);
 AceButton button2(SwitchPin2);
@@ -81,16 +81,7 @@ AceButton button6(SwitchPin6);
 
 // --- Phase Control Timing Map (Microseconds from Zero-Cross) ---
 const uint32_t spd[10] = {
-  9500, 
-  8500, 
-  7500, 
-  6500, 
-  5500, 
-  4500, 
-  3500, 
-  2500, 
-  1500, 
-  500   
+  9500, 8500, 7500, 6500, 5500, 4500, 3500, 2500, 1500, 500   
 };
 
 #define DIMMER_MIN 0
@@ -103,17 +94,14 @@ volatile bool triacState = false;
 
 auto timer = timer_create_default();
 
-// --- ESP32 Hardware Timer for Dimmer ---
 hw_timer_t *dimmerTimer = NULL;
 portMUX_TYPE dimmerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// --- Web Server, WebSocket & MQTT ---
 WebServer server(80);
 WebSocketsServer webSocket(81);
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 
-// --- Serial & Reconnection State ---
 String serialBuffer = "";
 unsigned long lastCharTime = 0;
 const unsigned long SERIAL_TIMEOUT = 50;
@@ -121,10 +109,9 @@ const unsigned long SERIAL_TIMEOUT = 50;
 unsigned long lastWiFiCheckTime = 0;
 const unsigned long WIFI_RETRY_INTERVAL = 10000; 
 unsigned long wifiDisconnectedStartTime = 0;         
-const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; // 10 minutes
+const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; 
 bool apModeActive = false;
 
-// --- GPIO 0 Button Press States (3s AP Mode & 10s Factory Reset) ---
 unsigned long buttonPressStartTime = 0;
 bool buttonStateLast = HIGH;
 const unsigned long LONG_PRESS_DURATION = 3000;       
@@ -157,7 +144,7 @@ void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 String getStateJSON();
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 
-// --- Main Dashboard HTML Template with WebSocket Client ---
+// --- Main Dashboard HTML Template ---
 const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -406,7 +393,7 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// --- Verbose Console Logger & WebSocket Broadcaster ---
+// --- Verbose Console Logger ---
 void logMessage(const String& msg) {
     Serial.println(msg);
     JsonDocument doc;
@@ -541,7 +528,7 @@ void setRelayState(int relay, bool turnOn) {
         default: return;
     }
     relayStates[relay - 1] = turnOn;
-    digitalWrite(pin, turnOn ? LOW : HIGH); // Low = Relay ON (active-low)
+    digitalWrite(pin, turnOn ? LOW : HIGH); 
 
     preferences.begin("config", false);
     preferences.putUChar(prefKey.c_str(), turnOn ? 1 : 0);
@@ -655,7 +642,7 @@ void checkWiFiConnection() {
     }
 }
 
-// --- GPIO 0 Button Handler (3s AP Mode & 10s Factory Reset) ---
+// --- GPIO 0 Button Handler ---
 void checkButton() {
     int currentState = digitalRead(CONFIG_BUTTON_PIN);
     
@@ -802,7 +789,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         case WStype_DISCONNECTED:
             break;
         case WStype_CONNECTED:
-            Serial.println("STATUS");
+            // Removed Serial.println("STATUS") here to prevent feedback loops!
             break;
         case WStype_TEXT: {
             JsonDocument doc;
@@ -838,7 +825,7 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
 void reconnectMQTT() {
     if (mqtt_enabled && !apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
         static unsigned long lastMqttRetry = 0;
-        const unsigned long MQTT_RETRY_INTERVAL = 300000; // 5 minutes
+        const unsigned long MQTT_RETRY_INTERVAL = 300000; 
         
         if (millis() - lastMqttRetry >= MQTT_RETRY_INTERVAL || lastMqttRetry == 0) { 
             lastMqttRetry = millis();
@@ -897,22 +884,20 @@ void handleCommand(const String& cmd) {
         setDimmerLevel(DIMMER_MIN);
         return;
     } else if (trimmedCmd == "STATUS") {
-        logMessage(">> [STATUS REQUEST] Refreshing States...");
-        broadcastState();
+        broadcastState(); // Sends state to WS/MQTT quietly without logging every poll to serial
         return;
     }
 
     broadcastState();
 }
 
-// --- State Broadcast ---
+// --- State Broadcast (Quietly pushes to network without filling Serial monitor logs) ---
 void broadcastState() {
     String out = getStateJSON();
     if (mqtt_enabled && mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
     webSocket.broadcastTXT(out);
-    logMessage(">> STATE BROADCAST: " + out);
 }
 
 // --- AceButton Event Handler ---

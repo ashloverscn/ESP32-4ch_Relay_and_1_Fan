@@ -1,0 +1,1501 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <Update.h>
+#include <IRremote.hpp>
+#include <AceButton.h>
+#include <arduino-timer.h>
+
+using namespace ace_button;
+
+Preferences preferences;
+
+// --- Default Fallback Credentials (Pre-filled on first boot) ---
+const char* DEFAULT_SSID = "ash_jio_2G";
+const char* DEFAULT_PASSWORD = "ThundersnO0w@,,#";
+
+const char* DEFAULT_MQTT_SERVER = "i11b0026.ala.eu-central-1.emqxsl.com";
+const int   DEFAULT_MQTT_PORT = 8883;
+const char* DEFAULT_MQTT_USER = "admin";
+const char* DEFAULT_MQTT_PASS = "admin1234S";
+const char* DEFAULT_MQTT_TOPIC_CMD = "home/esp32/command";
+const char* DEFAULT_MQTT_TOPIC_STATE = "home/esp32/state";
+const bool  DEFAULT_MQTT_ENABLED = true;
+
+const char* DEFAULT_WEB_USER = "admin";
+const char* DEFAULT_WEB_PASS = "admin1234S";
+
+// --- Runtime Configuration Variables ---
+String stored_ssid;
+String stored_password;
+String mqtt_server;
+int mqtt_port;
+String mqtt_user;
+String mqtt_pass;
+String mqtt_topic_cmd;
+String mqtt_topic_state;
+bool mqtt_enabled;
+String stored_web_user;
+String stored_web_pass;
+
+// --- Real Hardware IO Pin Assignments ---
+const int RelayPin1         = 23;
+const int RelayPin2         = 22;
+const int RelayPin3         = 21;
+const int RelayPin4         = 19;
+const int TriacPin          = 18;
+const int ZeroCrossPin      = 34;
+const int IR_RECV_PIN       = 35;
+const int BuzzerPin         = 4;
+const int CONFIG_BUTTON_PIN = 0;
+
+// --- Wall Switch / Button Pins (AceButton) ---
+#define SwitchPin1 13 // Relay 1 Toggle
+#define SwitchPin2 12 // Relay 2 Toggle
+#define SwitchPin3 14 // Relay 3 Toggle
+#define SwitchPin4 27 // Relay 4 Toggle
+#define SwitchPin5 32 // Dimmer Down / Long-Press Min
+#define SwitchPin6 33 // Dimmer Up / Long-Press Max
+
+AceButton button1(SwitchPin1);
+AceButton button2(SwitchPin2);
+AceButton button3(SwitchPin3);
+AceButton button4(SwitchPin4);
+AceButton button5(SwitchPin5);
+AceButton button6(SwitchPin6);
+
+// --- IR Remote Hex Codes ---
+#define IR_Button_1    0xF50A7F80
+#define IR_Button_2    0xE41B7F80
+#define IR_Button_3    0xE01F7F80
+#define IR_Button_4    0xF30C7F80
+#define IR_Button_5    0xF20D7F80
+#define IR_Button_Up   0xF9067F80
+#define IR_Button_Dn   0xFA057F80
+#define IR_All_Off     0xE11E7F80
+#define IR_All_On      0xED127F80
+
+// --- Phase Control Timing Map (Microseconds from Zero-Cross) ---
+const uint32_t spd[10] = {
+  9500, 8500, 7500, 6500, 5500, 4500, 3500, 2500, 1500, 500
+};
+
+#define DIMMER_MIN 0
+#define DIMMER_MAX 9
+
+// --- Hardware Controller State ---
+bool relayStates[4] = {false, false, false, false};
+uint8_t dimmerValue = 0;
+volatile bool triacState = false;
+
+bool batchFeedback = false;
+bool batchStateChanged = false;
+
+auto timer = timer_create_default();
+
+// --- ESP32 Hardware Timer for AC Phase Dimmer ---
+hw_timer_t *dimmerTimer = NULL;
+portMUX_TYPE dimmerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- Modern Web Server, WebSocket & MQTT ---
+WebServer server(80);
+WebSocketsServer webSocket(81);
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
+
+// --- Serial Buffering State (50ms Silence Timeout) ---
+String serialBuffer = "";
+unsigned long lastCharTime = 0;
+const unsigned long SERIAL_TIMEOUT = 50;
+
+// --- Wi-Fi Reconnection & AP Fallback State ---
+unsigned long lastWiFiCheckTime = 0;
+const unsigned long WIFI_RETRY_INTERVAL = 10000; 
+unsigned long wifiDisconnectedStartTime = 0;        
+const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; // 10 minutes
+
+// --- GPIO 0 Button Press States (3s AP Mode & 10s Factory Reset) ---
+unsigned long buttonPressStartTime = 0;
+bool buttonStateLast = HIGH;
+const unsigned long LONG_PRESS_DURATION = 3000;       // 3 seconds for AP Mode
+const unsigned long VERY_LONG_PRESS_DURATION = 10000; // 10 seconds for NVS Factory Reset
+bool apTriggered = false;
+bool factoryResetTriggered = false;
+bool apModeActive = false;
+
+// Forward declarations
+void loadConfig();
+void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState, bool mEnabled, String wUser, String wPass);
+void logMessage(const String& msg);
+void broadcastState();
+String getStateJSON();
+void handleCommand(const String& cmd);
+void processBufferedSerial(const String& data);
+void reconnectMQTT();
+void callbackMQTT(char* topic, byte* payload, unsigned int length);
+void checkWiFiConnection();
+void checkButton();
+void enterAPMode();
+void setupOTARoutes(bool requireAuth);
+
+void setRelayState(int relay, bool turnOn);
+void relayToggle(int relay);
+void setDimmerLevel(uint8_t val);
+void triacOn();
+void triacOff();
+void triacOnOff();
+void dimm_Up();
+void dimm_Dn();
+void all_Switch_ON();
+void all_Switch_OFF();
+void ir_remote();
+void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
+
+// --- Soft Buzzer Functions ---
+void beep(unsigned int frequency, unsigned long duration)
+{
+  if (frequency == 0 || duration == 0) return;
+
+  unsigned long halfPeriod = 500000UL / frequency;
+  unsigned long totalCycles = ((unsigned long)frequency * duration) / 1000;
+
+  for (unsigned long i = 0; i < totalCycles; i++)
+  {
+    digitalWrite(BuzzerPin, HIGH);
+    delayMicroseconds(halfPeriod);
+    digitalWrite(BuzzerPin, LOW);
+    delayMicroseconds(halfPeriod);
+  }
+}
+
+void beepStateChanged()
+{
+  beep(1400, 80);
+}
+
+void beepNoChange()
+{
+  beep(1100, 90);
+}
+
+void playStateFeedback(bool changed)
+{
+  if (batchFeedback)
+  {
+    if (changed) batchStateChanged = true;
+    return;
+  }
+
+  if (changed) beepStateChanged();
+  else beepNoChange();
+}
+
+// --- HTML Template (Dashboard) ---
+const char HTML_TEMPLATE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Home Automation Controller</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f6f8;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 650px;
+            background: #ffffff;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+            position: relative;
+        }
+        .config-link {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            text-decoration: none;
+            background-color: #6c757d;
+            color: white;
+            padding: 8px 12px;
+            font-size: 13px;
+            border-radius: 4px;
+            font-weight: bold;
+            transition: 0.2s;
+        }
+        .config-link:hover { background-color: #5a6268; }
+        h2 { text-align: center; margin-top: 0; color: #333; }
+        .card {
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+            background: #fafafa;
+        }
+        .card-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #555;
+            font-size: 14px;
+            text-transform: uppercase;
+        }
+        .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+        button {
+            padding: 10px 15px;
+            font-size: 14px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            transition: 0.2s;
+        }
+        button:hover { background-color: #0056b3; }
+        
+        .relay-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .relay-btn {
+            height: 70px;
+            font-weight: bold;
+            background-color: #e0e0e0;
+            color: #000;
+            border-radius: 6px;
+        }
+        .relay-btn.on {
+            background-color: #4CAF50;
+            color: #fff;
+        }
+
+        #console {
+            width: 100%;
+            height: 150px;
+            background-color: #1e1e1e;
+            color: #00ff00;
+            font-family: monospace;
+            font-size: 12px;
+            padding: 10px;
+            box-sizing: border-box;
+            overflow-y: scroll;
+            border-radius: 4px;
+            white-space: pre-wrap;
+        }
+        .flex-fill { flex: 1; }
+        #connectionStatus { font-weight: bold; padding: 5px 10px; border-radius: 4px; display: inline-block; }
+        .status-disconnected { background: #ffebee; color: #c62828; }
+        .status-connected { background: #e8f5e9; color: #2e7d32; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <a href="/config" class="config-link">⚙️ Config</a>
+    <h2>Home Automation Controller</h2>
+
+    <!-- Connection Status Banner -->
+    <div class="card">
+        <div class="card-title">ESP32 Gateway Status</div>
+        <div id="connectionStatus" class="status-disconnected">Status: Connecting...</div>
+    </div>
+
+    <!-- Relays Control -->
+    <div class="card">
+        <div class="card-title">Relay Controls</div>
+        <div class="relay-grid">
+            <button id="relay-1" class="relay-btn" onclick="toggleRelay(1)">Relay 1<br>OFF</button>
+            <button id="relay-2" class="relay-btn" onclick="toggleRelay(2)">Relay 2<br>OFF</button>
+            <button id="relay-3" class="relay-btn" onclick="toggleRelay(3)">Relay 3<br>OFF</button>
+            <button id="relay-4" class="relay-btn" onclick="toggleRelay(4)">Relay 4<br>OFF</button>
+        </div>
+    </div>
+
+    <!-- Dimmer Control -->
+    <div class="card">
+        <div class="card-title">Dimmer Control (0-9)</div>
+        <div class="row">
+            <button onclick="sendCommand('DIMMER:0')">MIN (0)</button>
+            <button onclick="stepDimmer(-1)">Step -</button>
+            <input type="range" id="dimmerSlider" class="flex-fill" min="0" max="9" value="0" onchange="onSliderChange(this.value)">
+            <button onclick="stepDimmer(1)">Step +</button>
+            <button onclick="sendCommand('DIMMER:9')">MAX (9)</button>
+        </div>
+    </div>
+
+    <!-- Global & Utilities -->
+    <div class="card">
+        <div class="card-title">Global Commands & Status</div>
+        <div class="row">
+            <button class="flex-fill" onclick="sendCommand('ALL_ON')">ALL ON</button>
+            <button class="flex-fill" onclick="sendCommand('ALL_OFF')">ALL OFF</button>
+            <button class="flex-fill" onclick="sendCommand('STATUS')">Get Status</button>
+        </div>
+    </div>
+
+    <!-- Console Log -->
+    <div class="card">
+        <div class="card-title">Serial Console / Feedback</div>
+        <div id="console"></div>
+    </div>
+</div>
+
+<script>
+    let ws;
+    let relayStates = [false, false, false, false];
+    let reconnectAttempts = 0;
+
+    function initWebSocket() {
+        ws = new WebSocket('ws://' + window.location.hostname + ':81/');
+        
+        ws.onopen = function(event) {
+            reconnectAttempts = 0;
+            updateConnectionBanner(true);
+            appendConsole("Connected to ESP32 WebSocket server.");
+            sendCommand('STATUS');
+        };
+        
+        ws.onclose = function(event) {
+            updateConnectionBanner(false);
+            let timeout = Math.min(1000 * Math.pow(1.5, reconnectAttempts), 10000);
+            appendConsole(`Disconnected. Reconnecting in ${Math.round(timeout/1000)}s...`);
+            setTimeout(initWebSocket, timeout);
+            reconnectAttempts++;
+        };
+        
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                if (data.type === 'console_log') {
+                    appendConsole(data.message);
+                } else {
+                    if (data.POWER1 !== undefined) updateRelayUI(1, data.POWER1 === 'ON');
+                    if (data.POWER2 !== undefined) updateRelayUI(2, data.POWER2 === 'ON');
+                    if (data.POWER3 !== undefined) updateRelayUI(3, data.POWER3 === 'ON');
+                    if (data.POWER4 !== undefined) updateRelayUI(4, data.POWER4 === 'ON');
+                    if (data.Dimmer !== undefined) {
+                        document.getElementById('dimmerSlider').value = data.Dimmer;
+                    }
+                }
+            } catch (e) {
+                appendConsole(event.data);
+            }
+        };
+    }
+
+    function updateConnectionBanner(connected) {
+        const banner = document.getElementById('connectionStatus');
+        if (connected) {
+            banner.innerText = "Status: Connected";
+            banner.className = "status-connected";
+        } else {
+            banner.innerText = "Status: Disconnected";
+            banner.className = "status-disconnected";
+        }
+    }
+
+    function toggleRelay(relayNum) {
+        const currentState = relayStates[relayNum - 1];
+        sendCommand(`POWER${relayNum} ${currentState ? 'OFF' : 'ON'}`);
+    }
+
+    function onSliderChange(val) {
+        sendCommand(`DIMMER:${val}`);
+    }
+
+    function stepDimmer(delta) {
+        const slider = document.getElementById('dimmerSlider');
+        let val = parseInt(slider.value) + delta;
+        if (val < 0) val = 0;
+        if (val > 9) val = 9;
+        slider.value = val;
+        sendCommand('DIMMER:' + val);
+    }
+
+    function sendCommand(cmd) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({command: cmd}));
+        }
+    }
+
+    function updateRelayUI(relayNum, isOn) {
+        relayStates[relayNum - 1] = isOn;
+        const btn = document.getElementById(`relay-${relayNum}`);
+        if (isOn) {
+            btn.innerText = `Relay ${relayNum}\nON`;
+            btn.classList.add('on');
+        } else {
+            btn.innerText = `Relay ${relayNum}\nOFF`;
+            btn.classList.remove('on');
+        }
+    }
+
+    function appendConsole(msg) {
+        const consoleEl = document.getElementById('console');
+        consoleEl.innerHTML += msg + '\n';
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+
+    window.onload = initWebSocket;
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// --- Configuration Page HTML ---
+const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device Configuration</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f6f8;
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+        }
+        .container {
+            width: 100%;
+            max-width: 500px;
+            background: #ffffff;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+        }
+        h2 { text-align: center; margin-top: 0; color: #333; }
+        .back-link {
+            display: inline-block;
+            margin-bottom: 15px;
+            text-decoration: none;
+            color: #007bff;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .back-link:hover { text-decoration: underline; }
+        label { font-weight: bold; font-size: 13px; color: #555; display: block; margin-top: 10px; }
+        input[type="text"], input[type="password"], input[type="number"], input[type="file"] {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 100%;
+            box-sizing: border-box;
+            margin-top: 5px;
+            margin-bottom: 5px;
+        }
+        .section-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+            margin-bottom: 10px;
+        }
+        .section-header-row h3 {
+            margin: 0;
+            color: #333;
+        }
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-weight: bold;
+            font-size: 13px;
+            color: #333;
+            cursor: pointer;
+        }
+        .checkbox-container input {
+            transform: scale(1.2);
+            cursor: pointer;
+        }
+        hr { border: 0; border-top: 1px solid #eee; margin: 20px 0; }
+        button {
+            width: 100%;
+            padding: 12px;
+            font-size: 15px;
+            border-radius: 4px;
+            border: none;
+            cursor: pointer;
+            background-color: #28a745;
+            color: white;
+            font-weight: bold;
+            margin-top: 15px;
+            transition: 0.2s;
+        }
+        button:hover { background-color: #218838; }
+        .btn-primary { background-color: #007bff; color: #fff; }
+        .btn-primary:hover { background-color: #0056b3; }
+        .btn-warning { background-color: #ffc107; color: #000; }
+        .btn-warning:hover { background-color: #e0a800; }
+        .btn-danger { background-color: #dc3545; color: #fff; }
+        .btn-danger:hover { background-color: #c82333; }
+        #otaStatus {
+            margin-top: 10px;
+            font-weight: bold;
+            font-size: 13px;
+            color: #007bff;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <a href="/" class="back-link">&larr; Back to Dashboard</a>
+    <h2>Device Configuration</h2>
+    
+    <form action="/save-settings" method="POST">
+        <h3>Wi-Fi Settings</h3>
+        <label>Wi-Fi SSID:</label>
+        <input type="text" name="wifi_ssid" id="cfg_ssid">
+        
+        <label>Wi-Fi Password:</label>
+        <input type="password" name="wifi_pass" id="cfg_pass_wifi">
+
+        <hr>
+        
+        <div class="section-header-row">
+            <h3>MQTT Settings</h3>
+            <label class="checkbox-container">
+                <input type="checkbox" name="mqtt_enabled" id="cfg_enabled"> Enable MQTT
+            </label>
+        </div>
+
+        <label>MQTT Server:</label>
+        <input type="text" name="mqtt_server" id="cfg_server">
+        
+        <label>MQTT Port:</label>
+        <input type="number" name="mqtt_port" id="cfg_port">
+        
+        <label>MQTT Username:</label>
+        <input type="text" name="mqtt_user" id="cfg_user">
+        
+        <label>MQTT Password:</label>
+        <input type="password" name="mqtt_pass" id="cfg_pass">
+        
+        <label>Command Topic:</label>
+        <input type="text" name="mqtt_topic_cmd" id="cfg_tcmd">
+        
+        <label>State Topic:</label>
+        <input type="text" name="mqtt_topic_state" id="cfg_tstate">
+
+        <hr>
+        <h3>Web Login Security</h3>
+        <label>Web Username:</label>
+        <input type="text" name="web_user" id="cfg_wuser">
+
+        <label>Web Password:</label>
+        <input type="password" name="web_pass" id="cfg_wpass">
+        
+        <button type="submit">Save & Reboot</button>
+    </form>
+
+    <hr>
+    <h3>Firmware Update (OTA)</h3>
+    <form method="POST" action="/update" enctype="multipart/form-data" onsubmit="document.getElementById('otaStatus').innerText = 'Uploading & Flashing Firmware... Do not power off!';">
+        <label>Select Compiled Firmware (.bin):</label>
+        <input type="file" name="update" accept=".bin" required>
+        <button type="submit" class="btn-primary">Upload & Flash Firmware</button>
+        <div id="otaStatus"></div>
+    </form>
+
+    <hr>
+    <h3>Device Actions</h3>
+    <button type="button" class="btn-warning" onclick="if(confirm('Reboot into AP Mode?')) location.href='/reboot-ap'">Reboot to AP Mode</button>
+    <button type="button" class="btn-danger" onclick="if(confirm('WARNING: This will erase all settings and factory reset! Continue?')) location.href='/factory-reset'">Factory Reset</button>
+</div>
+
+<script>
+    fetch('/get-config')
+        .then(res => res.json())
+        .then(data => {
+            document.getElementById('cfg_ssid').value = data.ssid || '';
+            document.getElementById('cfg_pass_wifi').value = data.pass_wifi || '';
+            document.getElementById('cfg_enabled').checked = data.enabled === 1 || data.enabled === true;
+            document.getElementById('cfg_server').value = data.server;
+            document.getElementById('cfg_port').value = data.port;
+            document.getElementById('cfg_user').value = data.user;
+            document.getElementById('cfg_pass').value = data.pass;
+            document.getElementById('cfg_tcmd').value = data.tcmd;
+            document.getElementById('cfg_tstate').value = data.tstate;
+            document.getElementById('cfg_wuser').value = data.wuser || 'admin';
+            document.getElementById('cfg_wpass').value = data.wpass || 'admin1234S';
+        });
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+// --- Hardware Timer & Interrupt Handlers for AC Dimming ---
+void IRAM_ATTR onDimmerTimer() {
+    portENTER_CRITICAL_ISR(&dimmerMux);
+    digitalWrite(TriacPin, HIGH);
+    ets_delay_us(50);
+    digitalWrite(TriacPin, LOW);
+    timerStop(dimmerTimer);
+    portEXIT_CRITICAL_ISR(&dimmerMux);
+}
+
+void IRAM_ATTR onZeroCross() {
+    portENTER_CRITICAL_ISR(&dimmerMux);
+    if (triacState && dimmerValue > 0) {
+        timerRestart(dimmerTimer);
+        timerAlarm(dimmerTimer, spd[dimmerValue], false, 0);
+    }
+    portEXIT_CRITICAL_ISR(&dimmerMux);
+}
+
+void applyDimmer() {
+    portENTER_CRITICAL(&dimmerMux);
+    if (!triacState || dimmerValue == 0) {
+        digitalWrite(TriacPin, LOW);
+    }
+    portEXIT_CRITICAL(&dimmerMux);
+}
+
+void setDimmerLevel(uint8_t val) {
+    if (val > DIMMER_MAX) val = DIMMER_MAX;
+
+    uint8_t oldDimmer = dimmerValue;
+    bool oldTriac = triacState;
+
+    dimmerValue = val;
+    triacState = (dimmerValue > 0);
+    applyDimmer();
+
+    preferences.begin("config", false);
+    preferences.putUChar("dimmer", dimmerValue);
+    preferences.putUChar("triacState", triacState ? 1 : 0);
+    preferences.end();
+
+    playStateFeedback(oldDimmer != dimmerValue || oldTriac != triacState);
+    logMessage(">> Dimmer set to: " + String(dimmerValue));
+    broadcastState();
+}
+
+void triacOn() {
+    bool oldTriac = triacState;
+    uint8_t oldDimmer = dimmerValue;
+
+    preferences.begin("config", false);
+    uint8_t savedDimmer = preferences.getUChar("dimmer", DIMMER_MAX);
+    dimmerValue = (savedDimmer > 0 && savedDimmer <= DIMMER_MAX) ? savedDimmer : DIMMER_MAX;
+    triacState = true;
+    applyDimmer();
+
+    preferences.putUChar("dimmer", dimmerValue);
+    preferences.putUChar("triacState", 1);
+    preferences.end();
+
+    playStateFeedback(oldDimmer != dimmerValue || !oldTriac);
+    logMessage(">> Dimmer set to: " + String(dimmerValue));
+    broadcastState();
+}
+
+void triacOff() {
+    bool oldTriac = triacState;
+    uint8_t oldDimmer = dimmerValue;
+
+    triacState = false;
+    dimmerValue = DIMMER_MIN;
+    applyDimmer();
+
+    preferences.begin("config", false);
+    preferences.putUChar("dimmer", dimmerValue);
+    preferences.putUChar("triacState", 0);
+    preferences.end();
+
+    playStateFeedback(oldDimmer != dimmerValue || oldTriac);
+    logMessage(">> Dimmer set to: 0");
+    broadcastState();
+}
+
+void triacOnOff() {
+    if (triacState) triacOff();
+    else triacOn();
+}
+
+void dimm_Up() {
+    if (!triacState) {
+        setDimmerLevel(1);
+        return;
+    }
+    if (dimmerValue < DIMMER_MAX) {
+        dimmerValue++;
+    }
+    setDimmerLevel(dimmerValue);
+}
+
+void dimm_Dn() {
+    if (!triacState) {
+        playStateFeedback(false);
+        return;
+    }
+    if (dimmerValue > DIMMER_MIN) {
+        dimmerValue--;
+    }
+    setDimmerLevel(dimmerValue);
+}
+
+// --- Active-HIGH Relay Control ---
+void setRelayState(int relay, bool turnOn) {
+    int pin = 0;
+    String prefKey = "";
+    switch (relay) {
+        case 1: pin = RelayPin1; prefKey = "relay1"; break;
+        case 2: pin = RelayPin2; prefKey = "relay2"; break;
+        case 3: pin = RelayPin3; prefKey = "relay3"; break;
+        case 4: pin = RelayPin4; prefKey = "relay4"; break;
+        default: return;
+    }
+
+    bool oldState = relayStates[relay - 1];
+    relayStates[relay - 1] = turnOn;
+    
+    // ACTIVE-HIGH CONFIGURATION: HIGH = Relay ON, LOW = Relay OFF
+    digitalWrite(pin, turnOn ? HIGH : LOW); 
+
+    preferences.begin("config", false);
+    preferences.putUChar(prefKey.c_str(), turnOn ? 1 : 0);
+    preferences.end();
+
+    playStateFeedback(oldState != turnOn);
+    logMessage(">> Relay " + String(relay) + " -> " + (turnOn ? "ON" : "OFF"));
+    broadcastState();
+}
+
+void relayToggle(int relay) {
+    int pin = 0;
+    switch (relay) {
+        case 1: pin = RelayPin1; break;
+        case 2: pin = RelayPin2; break;
+        case 3: pin = RelayPin3; break;
+        case 4: pin = RelayPin4; break;
+        default: return;
+    }
+    // For Active-HIGH, reading HIGH means the relay is currently ON
+    bool currentState = (digitalRead(pin) == HIGH);
+    setRelayState(relay, !currentState);
+}
+
+void all_Switch_ON() {
+    batchStateChanged = false;
+    batchFeedback = true;
+
+    for (int i = 1; i <= 4; i++) setRelayState(i, true);
+    setDimmerLevel(DIMMER_MAX);
+
+    batchFeedback = false;
+    playStateFeedback(batchStateChanged);
+}
+
+void all_Switch_OFF() {
+    batchStateChanged = false;
+    batchFeedback = true;
+
+    for (int i = 1; i <= 4; i++) setRelayState(i, false);
+    setDimmerLevel(DIMMER_MIN);
+
+    batchFeedback = false;
+    playStateFeedback(batchStateChanged);
+}
+
+// --- IR Remote Decoder ---
+void ir_remote() {
+    if (IrReceiver.decode()) {
+        if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+            uint32_t code = IrReceiver.decodedIRData.decodedRawData;
+            logMessage(">> IR Code Received: 0x" + String(code, HEX));
+            switch (code) {
+                case IR_Button_1:  relayToggle(1); break;
+                case IR_Button_2:  relayToggle(2); break;
+                case IR_Button_3:  relayToggle(3); break;
+                case IR_Button_4:  relayToggle(4); break;
+                case IR_Button_5:  triacOnOff(); break;
+                case IR_Button_Up: dimm_Up(); break;
+                case IR_Button_Dn: dimm_Dn(); break;
+                case IR_All_Off:   all_Switch_OFF(); break;
+                case IR_All_On:    all_Switch_ON(); break;
+                default: break;
+            }
+        }
+        IrReceiver.resume();
+    }
+}
+
+// --- AceButton Event Handler ---
+void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
+    uint8_t pin = button->getPin();
+
+    switch (eventType) {
+        case AceButton::kEventClicked:
+            if (pin == SwitchPin1) relayToggle(1);
+            else if (pin == SwitchPin2) relayToggle(2);
+            else if (pin == SwitchPin3) relayToggle(3);
+            else if (pin == SwitchPin4) relayToggle(4);
+            else if (pin == SwitchPin5) dimm_Dn();
+            else if (pin == SwitchPin6) dimm_Up();
+            break;
+
+        case AceButton::kEventLongPressed:
+            if (pin == SwitchPin5) setDimmerLevel(DIMMER_MIN);
+            else if (pin == SwitchPin6) setDimmerLevel(DIMMER_MAX);
+            break;
+    }
+}
+
+// --- Load and Save Configurations via Preferences (NVS) ---
+void loadConfig() {
+    preferences.begin("config", false);
+    stored_ssid = preferences.getString("ssid", DEFAULT_SSID);
+    stored_password = preferences.getString("password", DEFAULT_PASSWORD);
+    mqtt_server = preferences.getString("server", DEFAULT_MQTT_SERVER);
+    mqtt_port = preferences.getInt("port", DEFAULT_MQTT_PORT);
+    mqtt_user = preferences.getString("user", DEFAULT_MQTT_USER);
+    mqtt_pass = preferences.getString("pass", DEFAULT_MQTT_PASS);
+    mqtt_topic_cmd = preferences.getString("tcmd", DEFAULT_MQTT_TOPIC_CMD);
+    mqtt_topic_state = preferences.getString("tstate", DEFAULT_MQTT_TOPIC_STATE);
+    mqtt_enabled = preferences.getBool("enabled", DEFAULT_MQTT_ENABLED);
+    stored_web_user = preferences.getString("wuser", DEFAULT_WEB_USER);
+    stored_web_pass = preferences.getString("wpass", DEFAULT_WEB_PASS);
+
+    if (stored_web_user.length() == 0 || stored_web_user.length() > 32) {
+        stored_web_user = DEFAULT_WEB_USER;
+    }
+    if (stored_web_pass.length() == 0 || stored_web_pass.length() > 32) {
+        stored_web_pass = DEFAULT_WEB_PASS;
+    }
+
+    uint8_t r1 = preferences.getUChar("relay1", 0);
+    uint8_t r2 = preferences.getUChar("relay2", 0);
+    uint8_t r3 = preferences.getUChar("relay3", 0);
+    uint8_t r4 = preferences.getUChar("relay4", 0);
+    dimmerValue = preferences.getUChar("dimmer", 0);
+    uint8_t storedTriac = preferences.getUChar("triacState", 0);
+    preferences.end();
+
+    batchFeedback = true;
+    setRelayState(1, r1 == 1);
+    setRelayState(2, r2 == 1);
+    setRelayState(3, r3 == 1);
+    setRelayState(4, r4 == 1);
+    batchFeedback = false;
+
+    triacState = (storedTriac == 1 || dimmerValue > 0);
+    applyDimmer();
+}
+
+void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState, bool mEnabled, String wUser, String wPass) {
+    preferences.begin("config", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", pass);
+    preferences.putString("server", srv);
+    preferences.putInt("port", prt);
+    preferences.putString("user", usr);
+    preferences.putString("pass", pwd);
+    preferences.putString("tcmd", tCmd);
+    preferences.putString("tstate", tState);
+    preferences.putBool("enabled", mEnabled);
+    preferences.putString("wuser", wUser);
+    preferences.putString("wpass", wPass);
+    preferences.end();
+}
+
+// --- State JSON & Broadcast Helpers ---
+String getStateJSON() {
+    JsonDocument doc;
+    doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
+    doc["POWER2"] = relayStates[1] ? "ON" : "OFF";
+    doc["POWER3"] = relayStates[2] ? "ON" : "OFF";
+    doc["POWER4"] = relayStates[3] ? "ON" : "OFF";
+    doc["Dimmer"] = dimmerValue;
+    String output;
+    serializeJson(doc, output);
+    return output;
+}
+
+void broadcastState() {
+    String out = getStateJSON();
+    if (mqtt_enabled && mqttClient.connected()) {
+        mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
+    }
+    webSocket.broadcastTXT(out);
+}
+
+// --- Verbose Console Logger ---
+void logMessage(const String& msg) {
+    Serial.println(msg);
+    JsonDocument doc;
+    doc["type"] = "console_log";
+    doc["message"] = msg;
+    String output;
+    serializeJson(doc, output);
+    webSocket.broadcastTXT(output);
+}
+
+// --- Continuous Non-Blocking Wi-Fi Reconnection & 10-Min AP Fallback ---
+void checkWiFiConnection() {
+    if (!apModeActive) {
+        if (WiFi.status() == WL_CONNECTED) {
+            wifiDisconnectedStartTime = 0; 
+        } else {
+            if (wifiDisconnectedStartTime == 0) {
+                wifiDisconnectedStartTime = millis();
+                logMessage(">> WiFi lost. Starting 10-minute AP fallback timer...");
+            } 
+            else if (millis() - wifiDisconnectedStartTime >= WIFI_AP_FALLBACK_TIMEOUT) {
+                logMessage(">> WiFi reconnection timed out (10 mins exceeded). Entering AP Mode automatically...");
+                enterAPMode();
+                return;
+            }
+
+            unsigned long currentMillis = millis();
+            if (currentMillis - lastWiFiCheckTime >= WIFI_RETRY_INTERVAL) {
+                lastWiFiCheckTime = currentMillis;
+                logMessage(">> WiFi Disconnected. Attempting reconnection...");
+                WiFi.disconnect();
+                WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
+            }
+        }
+    }
+}
+
+// --- GPIO 0 Button Handler (3s AP Mode & 10s Factory Reset) ---
+void checkButton() {
+    int currentState = digitalRead(CONFIG_BUTTON_PIN);
+    
+    if (currentState == LOW && buttonStateLast == HIGH) {
+        buttonPressStartTime = millis();
+        buttonStateLast = LOW;
+        apTriggered = false;
+        factoryResetTriggered = false;
+    } 
+    else if (currentState == LOW && buttonStateLast == LOW) {
+        unsigned long heldTime = millis() - buttonPressStartTime;
+        
+        // 10-Second Very Long Press: Erase NVS & Boot into AP Mode
+        if (heldTime >= VERY_LONG_PRESS_DURATION && !factoryResetTriggered) {
+            factoryResetTriggered = true;
+            logMessage(">> [FACTORY RESET] 10s Very Long Press detected! Erasing NVS storage & entering AP Mode...");
+            
+            preferences.begin("config", false);
+            preferences.clear();
+            preferences.end();
+            
+            delay(500);
+            enterAPMode();
+        }
+        // 3-Second Long Press: Enter AP Configuration Mode
+        else if (heldTime >= LONG_PRESS_DURATION && heldTime < VERY_LONG_PRESS_DURATION && !apTriggered && !apModeActive) {
+            apTriggered = true;
+            logMessage(">> 3s Long Press detected! Entering AP Configuration Mode...");
+            enterAPMode();
+        }
+    } 
+    else if (currentState == HIGH && buttonStateLast == LOW) {
+        buttonStateLast = HIGH;
+    }
+}
+
+// --- ESP32 Web OTA Firmware Update Handler ---
+void setupOTARoutes(bool requireAuth) {
+    server.on("/update", HTTP_POST, [requireAuth]() {
+        if (requireAuth && !server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.sendHeader("Connection", "close");
+        if (Update.hasError()) {
+            server.send(200, "text/html", "<h3>OTA Update Failed! Rebooting...</h3><script>setTimeout(()=>{window.location='/'}, 4000);</script>");
+        } else {
+            server.send(200, "text/html", "<h3>OTA Update Successful! Rebooting ESP32...</h3><script>setTimeout(()=>{window.location='/'}, 6000);</script>");
+        }
+        delay(1000);
+        ESP.restart();
+    }, [requireAuth]() {
+        if (requireAuth && !server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return;
+        }
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf(">> [OTA] Update Start: %s\n", upload.filename.c_str());
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { 
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) { 
+                Serial.printf(">> [OTA] Update Success: %u bytes\nRebooting...\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
+            }
+        }
+    });
+}
+
+// --- Enter Access Point Mode for Reconfiguration ---
+void enterAPMode() {
+    apModeActive = true;
+    WiFi.disconnect();
+    WiFi.mode(WIFI_AP);
+    
+    bool apStarted = WiFi.softAP("ESP32-Setup-AP", "12345678");
+    if (apStarted) {
+        logMessage(">> AP Mode Started Successfully!");
+        logMessage(">> SSID: ESP32-Setup-AP | Password: 12345678");
+        logMessage(">> Connect and open http://192.168.4.1");
+    } else {
+        logMessage(">> Failed to start AP Mode!");
+    }
+
+    webSocket.close();
+    server.stop();
+
+    server.on("/", HTTP_GET, []() {
+        server.send_P(200, "text/html", CONFIG_PAGE);
+    });
+
+    server.on("/config", HTTP_GET, []() {
+        server.send_P(200, "text/html", CONFIG_PAGE);
+    });
+
+    server.on("/get-config", HTTP_GET, []() {
+        JsonDocument doc;
+        doc["ssid"] = stored_ssid;
+        doc["pass_wifi"] = stored_password;
+        doc["enabled"] = mqtt_enabled;
+        doc["server"] = mqtt_server;
+        doc["port"] = mqtt_port;
+        doc["user"] = mqtt_user;
+        doc["pass"] = mqtt_pass;
+        doc["tcmd"] = mqtt_topic_cmd;
+        doc["tstate"] = mqtt_topic_state;
+        doc["wuser"] = stored_web_user;
+        doc["wpass"] = stored_web_pass;
+        String response;
+        serializeJson(doc, response);
+        server.send(200, "application/json", response);
+    });
+
+    server.on("/save-settings", HTTP_POST, []() {
+        String s_ssid = server.hasArg("wifi_ssid") ? server.arg("wifi_ssid") : DEFAULT_SSID;
+        String s_pass = server.hasArg("wifi_pass") ? server.arg("wifi_pass") : DEFAULT_PASSWORD;
+        bool mEnabled = server.hasArg("mqtt_enabled");
+        String srv = server.hasArg("mqtt_server") ? server.arg("mqtt_server") : DEFAULT_MQTT_SERVER;
+        int prt = server.hasArg("mqtt_port") ? server.arg("mqtt_port").toInt() : DEFAULT_MQTT_PORT;
+        String usr = server.hasArg("mqtt_user") ? server.arg("mqtt_user") : DEFAULT_MQTT_USER;
+        String pwd = server.hasArg("mqtt_pass") ? server.arg("mqtt_pass") : DEFAULT_MQTT_PASS;
+        String tCmd = server.hasArg("mqtt_topic_cmd") ? server.arg("mqtt_topic_cmd") : DEFAULT_MQTT_TOPIC_CMD;
+        String tState = server.hasArg("mqtt_topic_state") ? server.arg("mqtt_topic_state") : DEFAULT_MQTT_TOPIC_STATE;
+        String wUser = server.hasArg("web_user") && server.arg("web_user") != "" ? server.arg("web_user") : DEFAULT_WEB_USER;
+        String wPass = server.hasArg("web_pass") && server.arg("web_pass") != "" ? server.arg("web_pass") : DEFAULT_WEB_PASS;
+
+        saveConfig(s_ssid, s_pass, srv, prt, usr, pwd, tCmd, tState, mEnabled, wUser, wPass);
+
+        server.send(200, "text/html", "<h3>Settings Saved! Restarting ESP32...</h3><script>setTimeout(()=>{window.location='/'}, 4000);</script>");
+        delay(1000);
+        ESP.restart();
+    });
+
+    setupOTARoutes(false);
+
+    server.on("/reboot-ap", HTTP_GET, []() {
+        server.send(200, "text/html", "<h3>Rebooting to AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
+    server.on("/factory-reset", HTTP_GET, []() {
+        preferences.begin("config", false);
+        preferences.clear();
+        preferences.end();
+        server.send(200, "text/html", "<h3>Factory Reset Complete! Entering AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
+    server.begin();
+}
+
+// --- WebSocket Event Callback ---
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            break;
+        case WStype_CONNECTED:
+            broadcastState();
+            break;
+        case WStype_TEXT: {
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, payload, length);
+            if (!error && doc.containsKey("command")) {
+                String cmd = doc["command"].as<String>();
+                handleCommand(cmd);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// --- MQTT Callback for Inbound Commands ---
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    message.trim();
+    
+    logMessage("<< [MQTT Received on " + String(topic) + "]: " + message);
+
+    if (String(topic) == mqtt_topic_cmd) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, message);
+        if (!error && doc.containsKey("command")) {
+            String cmd = doc["command"].as<String>();
+            handleCommand(cmd);
+        } else {
+            handleCommand(message);
+        }
+    }
+}
+
+// --- Reconnect MQTT ---
+void reconnectMQTT() {
+    if (mqtt_enabled && !apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
+        static unsigned long lastMqttRetry = 0;
+        const unsigned long MQTT_RETRY_INTERVAL = 300000; // 5 minutes
+        
+        if (millis() - lastMqttRetry >= MQTT_RETRY_INTERVAL || lastMqttRetry == 0) { 
+            lastMqttRetry = millis();
+            logMessage(">> Attempting MQTT connection...");
+            String clientId = "ESP32Gateway-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+            if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
+                logMessage(">> MQTT Connected!");
+                mqttClient.subscribe(mqtt_topic_cmd.c_str());
+                lastMqttRetry = 0; 
+            } else {
+                logMessage(">> MQTT Connection failed, rc=" + String(mqttClient.state()) + ". Retrying in 5 minutes...");
+            }
+        }
+    }
+}
+
+// --- Bridge & Local Hardware Command Dispatcher ---
+void handleCommand(const String& cmd) {
+    String trimmedCmd = cmd;
+    trimmedCmd.trim();
+
+    String upperCmd = trimmedCmd;
+    upperCmd.toUpperCase();
+
+    // Check Relay Commands
+    for (int i = 1; i <= 4; i++) {
+        if (upperCmd == "POWER" + String(i) + " ON" || upperCmd == "POWER" + String(i) + ":ON" || upperCmd == "R" + String(i) + "_ON") {
+            setRelayState(i, true);
+            return;
+        } else if (upperCmd == "POWER" + String(i) + " OFF" || upperCmd == "POWER" + String(i) + ":OFF" || upperCmd == "R" + String(i) + "_OFF") {
+            setRelayState(i, false);
+            return;
+        }
+    }
+
+    // Check Dimmer & Global Commands
+    if (upperCmd.startsWith("DIMMER:") || upperCmd.startsWith("DIMMER ")) {
+        int val = upperCmd.substring(7).toInt();
+        setDimmerLevel(val);
+        return;
+    } else if (upperCmd == "DIMM_UP" || upperCmd == "IR_UP") {
+        dimm_Up();
+        return;
+    } else if (upperCmd == "DIMM_DN" || upperCmd == "IR_DN") {
+        dimm_Dn();
+        return;
+    } else if (upperCmd == "ALL_ON") {
+        all_Switch_ON();
+        return;
+    } else if (upperCmd == "ALL_OFF") {
+        all_Switch_OFF();
+        return;
+    } else if (upperCmd == "STATUS") {
+        broadcastState();
+        return;
+    }
+
+    logMessage(">> " + trimmedCmd);
+}
+
+// --- Serial Batch Parser ---
+void processBufferedSerial(const String& data) {
+    String bufferCopy = data;
+    bufferCopy.trim();
+    if (bufferCopy.length() == 0) return;
+
+    int startIdx = 0;
+    while (startIdx < (int)bufferCopy.length()) {
+        int nextNewline = bufferCopy.indexOf('\n', startIdx);
+        if (nextNewline == -1) nextNewline = bufferCopy.length();
+
+        String line = bufferCopy.substring(startIdx, nextNewline);
+        line.trim();
+
+        if (line.length() > 0) {
+            JsonDocument doc;
+            DeserializationError error = deserializeJson(doc, line);
+            if (!error) {
+                if (doc.containsKey("command")) {
+                    handleCommand(doc["command"].as<String>());
+                } else {
+                    webSocket.broadcastTXT(line);
+                    if (mqtt_enabled && mqttClient.connected()) {
+                        mqttClient.publish(mqtt_topic_state.c_str(), line.c_str());
+                    }
+                }
+            } else {
+                handleCommand(line);
+            }
+        }
+        startIdx = nextNewline + 1;
+    }
+}
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(RelayPin1, OUTPUT);
+    pinMode(RelayPin2, OUTPUT);
+    pinMode(RelayPin3, OUTPUT);
+    pinMode(RelayPin4, OUTPUT);
+    pinMode(TriacPin, OUTPUT);
+    pinMode(BuzzerPin, OUTPUT);
+
+    // ACTIVE-HIGH RELAYS: Initialize default state to LOW (OFF)
+    digitalWrite(RelayPin1, LOW);
+    digitalWrite(RelayPin2, LOW);
+    digitalWrite(RelayPin3, LOW);
+    digitalWrite(RelayPin4, LOW);
+    digitalWrite(TriacPin, LOW);
+    digitalWrite(BuzzerPin, LOW);
+
+    pinMode(ZeroCrossPin, INPUT_PULLUP);
+    pinMode(SwitchPin1, INPUT_PULLUP);
+    pinMode(SwitchPin2, INPUT_PULLUP);
+    pinMode(SwitchPin3, INPUT_PULLUP);
+    pinMode(SwitchPin4, INPUT_PULLUP);
+    pinMode(SwitchPin5, INPUT_PULLUP);
+    pinMode(SwitchPin6, INPUT_PULLUP);
+
+    ButtonConfig* config1 = button1.getButtonConfig();
+    config1->setEventHandler(handleEvent);
+    config1->setFeature(ButtonConfig::kFeatureClick);
+
+    ButtonConfig* config2 = button2.getButtonConfig();
+    config2->setEventHandler(handleEvent);
+    config2->setFeature(ButtonConfig::kFeatureClick);
+
+    ButtonConfig* config3 = button3.getButtonConfig();
+    config3->setEventHandler(handleEvent);
+    config3->setFeature(ButtonConfig::kFeatureClick);
+
+    ButtonConfig* config4 = button4.getButtonConfig();
+    config4->setEventHandler(handleEvent);
+    config4->setFeature(ButtonConfig::kFeatureClick);
+
+    ButtonConfig* config5 = button5.getButtonConfig();
+    config5->setEventHandler(handleEvent);
+    config5->setFeature(ButtonConfig::kFeatureClick);
+    config5->setFeature(ButtonConfig::kFeatureLongPress);
+    config5->setLongPressDelay(1200);
+
+    ButtonConfig* config6 = button6.getButtonConfig();
+    config6->setEventHandler(handleEvent);
+    config6->setFeature(ButtonConfig::kFeatureClick);
+    config6->setFeature(ButtonConfig::kFeatureLongPress);
+    config6->setLongPressDelay(1200);
+
+    loadConfig();
+
+    dimmerTimer = timerBegin(1000000);
+    if (dimmerTimer) {
+        timerAttachInterrupt(dimmerTimer, &onDimmerTimer);
+        attachInterrupt(digitalPinToInterrupt(ZeroCrossPin), onZeroCross, CHANGE);
+    }
+
+    IrReceiver.begin(IR_RECV_PIN, ENABLE_LED_FEEDBACK);
+
+    WiFi.begin(stored_ssid.c_str(), stored_password.c_str());
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        if (millis() - startAttempt > 15000) {
+            break;
+        }
+    }
+
+    if (mqtt_enabled) {
+        espClient.setInsecure();
+        mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
+        mqttClient.setCallback(callbackMQTT);
+        mqttClient.setBufferSize(512);
+    }
+
+    server.on("/", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.send_P(200, "text/html", HTML_TEMPLATE);
+    });
+
+    server.on("/config", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.send_P(200, "text/html", CONFIG_PAGE);
+    });
+
+    server.on("/get-config", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        JsonDocument doc;
+        doc["ssid"] = stored_ssid;
+        doc["pass_wifi"] = stored_password;
+        doc["enabled"] = mqtt_enabled;
+        doc["server"] = mqtt_server;
+        doc["port"] = mqtt_port;
+        doc["user"] = mqtt_user;
+        doc["pass"] = mqtt_pass;
+        doc["tcmd"] = mqtt_topic_cmd;
+        doc["tstate"] = mqtt_topic_state;
+        doc["wuser"] = stored_web_user;
+        doc["wpass"] = stored_web_pass;
+        String response;
+        serializeJson(doc, response);
+        server.send(200, "application/json", response);
+    });
+
+    server.on("/save-settings", HTTP_POST, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        String s_ssid = server.hasArg("wifi_ssid") ? server.arg("wifi_ssid") : DEFAULT_SSID;
+        String s_pass = server.hasArg("wifi_pass") ? server.arg("wifi_pass") : DEFAULT_PASSWORD;
+        bool mEnabled = server.hasArg("mqtt_enabled");
+        String srv = server.hasArg("mqtt_server") ? server.arg("mqtt_server") : DEFAULT_MQTT_SERVER;
+        int prt = server.hasArg("mqtt_port") ? server.arg("mqtt_port").toInt() : DEFAULT_MQTT_PORT;
+        String usr = server.hasArg("mqtt_user") ? server.arg("mqtt_user") : DEFAULT_MQTT_USER;
+        String pwd = server.hasArg("mqtt_pass") ? server.arg("mqtt_pass") : DEFAULT_MQTT_PASS;
+        String tCmd = server.hasArg("mqtt_topic_cmd") ? server.arg("mqtt_topic_cmd") : DEFAULT_MQTT_TOPIC_CMD;
+        String tState = server.hasArg("mqtt_topic_state") ? server.arg("mqtt_topic_state") : DEFAULT_MQTT_TOPIC_STATE;
+        String wUser = server.hasArg("web_user") && server.arg("web_user") != "" ? server.arg("web_user") : DEFAULT_WEB_USER;
+        String wPass = server.hasArg("web_pass") && server.arg("web_pass") != "" ? server.arg("web_pass") : DEFAULT_WEB_PASS;
+
+        saveConfig(s_ssid, s_pass, srv, prt, usr, pwd, tCmd, tState, mEnabled, wUser, wPass);
+
+        server.send(200, "text/html", "<h3>Settings Saved! Restarting ESP32...</h3><script>setTimeout(()=>{window.location='/'}, 4000);</script>");
+        delay(1000);
+        ESP.restart();
+    });
+
+    setupOTARoutes(true);
+
+    server.on("/reboot-ap", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.send(200, "text/html", "<h3>Rebooting to AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
+    server.on("/factory-reset", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        preferences.begin("config", false);
+        preferences.clear();
+        preferences.end();
+        server.send(200, "text/html", "<h3>Factory Reset Complete! Entering AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
+    server.begin();
+
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+
+    // Startup beep (2500Hz for 50ms)
+    beep(2500, 50);
+}
+
+// --- Main Loop ---
+void loop() {
+    checkButton();
+
+    if (apModeActive) {
+        server.handleClient();
+        button1.check();
+        button2.check();
+        button3.check();
+        button4.check();
+        button5.check();
+        button6.check();
+        ir_remote();
+        return;
+    }
+
+    checkWiFiConnection();
+
+    if (mqtt_enabled) {
+        if (!mqttClient.connected()) {
+            reconnectMQTT();
+        }
+        mqttClient.loop();
+    }
+
+    webSocket.loop();
+    server.handleClient();
+
+    button1.check();
+    button2.check();
+    button3.check();
+    button4.check();
+    button5.check();
+    button6.check();
+
+    ir_remote();
+
+    while (Serial.available()) {
+        char c = Serial.read();
+        lastCharTime = millis();
+        if (serialBuffer.length() < 512) {
+            serialBuffer += c;
+        } else {
+            serialBuffer = ""; 
+        }
+    }
+
+    if (serialBuffer.length() > 0 && (millis() - lastCharTime >= SERIAL_TIMEOUT)) {
+        processBufferedSerial(serialBuffer);
+        serialBuffer = "";
+    }
+}

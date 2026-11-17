@@ -155,6 +155,7 @@ void all_Switch_ON();
 void all_Switch_OFF();
 void ir_remote();
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
+bool sendPeriodicStatus(void*);
 
 // --- Soft Buzzer Functions ---
 void beep(unsigned int frequency, unsigned long duration)
@@ -749,7 +750,7 @@ void dimm_Dn() {
     setDimmerLevel(dimmerValue);
 }
 
-// --- Active-HIGH Relay Control ---
+// --- Active-HIGH Relay Control with Full Serial / MQTT / Web Sync ---
 void setRelayState(int relay, bool turnOn) {
     int pin = 0;
     String prefKey = "";
@@ -773,6 +774,8 @@ void setRelayState(int relay, bool turnOn) {
 
     playStateFeedback(oldState != turnOn);
     logMessage(">> Relay " + String(relay) + " -> " + (turnOn ? "ON" : "OFF"));
+    
+    // Broadcast state updates to WebSockets, MQTT, and Serial to keep total sync
     broadcastState();
 }
 
@@ -856,6 +859,12 @@ void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
     }
 }
 
+// --- Periodic Status Telemetry ---
+bool sendPeriodicStatus(void*) {
+    broadcastState();
+    return true;
+}
+
 // --- Load and Save Configurations via Preferences (NVS) ---
 void loadConfig() {
     preferences.begin("config", false);
@@ -928,6 +937,7 @@ String getStateJSON() {
 
 void broadcastState() {
     String out = getStateJSON();
+    Serial.println(out); // Outputs JSON over Serial for full system synchronization
     if (mqtt_enabled && mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
@@ -985,7 +995,6 @@ void checkButton() {
     else if (currentState == LOW && buttonStateLast == LOW) {
         unsigned long heldTime = millis() - buttonPressStartTime;
         
-        // 10-Second Very Long Press: Erase NVS & Boot into AP Mode
         if (heldTime >= VERY_LONG_PRESS_DURATION && !factoryResetTriggered) {
             factoryResetTriggered = true;
             logMessage(">> [FACTORY RESET] 10s Very Long Press detected! Erasing NVS storage & entering AP Mode...");
@@ -997,7 +1006,6 @@ void checkButton() {
             delay(500);
             enterAPMode();
         }
-        // 3-Second Long Press: Enter AP Configuration Mode
         else if (heldTime >= LONG_PRESS_DURATION && heldTime < VERY_LONG_PRESS_DURATION && !apTriggered && !apModeActive) {
             apTriggered = true;
             logMessage(">> 3s Long Press detected! Entering AP Configuration Mode...");

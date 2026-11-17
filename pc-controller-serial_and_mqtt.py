@@ -117,7 +117,7 @@ class ESP32ControllerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("ESP32 Home Automation Controller (Serial / WebSocket / MQTT)")
-        self.root.geometry("640x700")
+        self.root.geometry("660x700")
         self.root.resizable(False, False)
 
         # Connection states
@@ -152,6 +152,8 @@ class ESP32ControllerApp:
             "baud": 115200,
             "esp_ip": "192.168.29.110",
             "ws_port": 81,
+            "web_user": "admin",
+            "web_pass": "admin1234S",
             "mqtt_server": "i11b0026.ala.eu-central-1.emqxsl.com",
             "mqtt_port": 8883,
             "mqtt_user": "admin",
@@ -273,22 +275,31 @@ class ESP32ControllerApp:
         )
         self.connect_btn.grid(row=0, column=5, padx=5)
 
-        # --- IP / WEBSOCKET CONNECTION FRAME (Browser UI WS) ---
+        # --- IP / WEBSOCKET CONNECTION FRAME (Single Line: IP, User, Pass, Connect Button) ---
         ip_frame = ttk.LabelFrame(
             self.root, text="Browser UI / WebSocket Connection (Wi-Fi)", padding=10
         )
         ip_frame.pack(fill="x", padx=10, pady=6)
 
-        ttk.Label(ip_frame, text="ESP32 IP:").grid(
-            row=0, column=0, sticky="w", padx=5
-        )
-        self.ip_entry = ttk.Entry(ip_frame, width=22)
-        self.ip_entry.grid(row=0, column=1, padx=5)
+        row_single = ttk.Frame(ip_frame)
+        row_single.pack(fill="x", pady=2)
+
+        ttk.Label(row_single, text="IP:").pack(side="left", padx=(2, 4))
+        self.ip_entry = ttk.Entry(row_single, width=14)
+        self.ip_entry.pack(side="left", padx=(0, 8))
+
+        ttk.Label(row_single, text="User:").pack(side="left", padx=(0, 4))
+        self.web_user_entry = ttk.Entry(row_single, width=10)
+        self.web_user_entry.pack(side="left", padx=(0, 8))
+
+        ttk.Label(row_single, text="Pass:").pack(side="left", padx=(0, 4))
+        self.web_pass_entry = ttk.Entry(row_single, width=12, show="*")
+        self.web_pass_entry.pack(side="left", padx=(0, 8))
 
         self.ip_connect_btn = ttk.Button(
-            ip_frame, text="Connect IP", command=self.toggle_ip_connection
+            row_single, text="Connect IP", command=self.toggle_ip_connection
         )
-        self.ip_connect_btn.grid(row=0, column=2, padx=10)
+        self.ip_connect_btn.pack(side="left", padx=2)
 
         # --- RELAYS FRAME (4 Relays) ---
         relay_frame = ttk.LabelFrame(self.root, text="Relay Controls (4-Channel)", padding=10)
@@ -404,6 +415,8 @@ class ESP32ControllerApp:
         saved_port = self.config.get("port")
         saved_baud = self.config.get("baud")
         saved_ip = self.config.get("esp_ip")
+        saved_wuser = self.config.get("web_user", "admin")
+        saved_wpass = self.config.get("web_pass", "admin1234S")
         available_ports = list(self.port_combo["values"])
 
         if saved_baud:
@@ -416,6 +429,14 @@ class ESP32ControllerApp:
         if saved_ip:
             self.ip_entry.delete(0, tk.END)
             self.ip_entry.insert(0, str(saved_ip))
+
+        if saved_wuser:
+            self.web_user_entry.delete(0, tk.END)
+            self.web_user_entry.insert(0, str(saved_wuser))
+
+        if saved_wpass:
+            self.web_pass_entry.delete(0, tk.END)
+            self.web_pass_entry.insert(0, str(saved_wpass))
 
     def toggle_connection(self):
         if not self.is_connected:
@@ -485,39 +506,53 @@ class ESP32ControllerApp:
                 return
 
             ip_address = self.ip_entry.get().strip()
+            w_user = self.web_user_entry.get().strip()
+            w_pass = self.web_pass_entry.get().strip()
+
             if not ip_address:
                 messagebox.showerror("Error", "Please enter a valid ESP32 IP address.")
                 return
 
             self.config["esp_ip"] = ip_address
+            self.config["web_user"] = w_user
+            self.config["web_pass"] = w_pass
             self.save_config_to_disk()
 
             # Start WebSocket connection thread
             self.ws_thread = threading.Thread(
-                target=self.start_ws_client_thread, args=(ip_address,), daemon=True
+                target=self.start_ws_client_thread, args=(ip_address, w_user, w_pass), daemon=True
             )
             self.ws_thread.start()
         else:
             self.disconnect_ip()
 
-    def start_ws_client_thread(self, ip):
+    def start_ws_client_thread(self, ip, user, password):
         self.ws_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.ws_loop)
         try:
-            self.ws_loop.run_until_complete(self.ws_client_handler(ip))
+            self.ws_loop.run_until_complete(self.ws_client_handler(ip, user, password))
         except Exception as e:
             self.safe_log(f">> WebSocket Loop Error: {e}\n")
 
-    async def ws_client_handler(self, ip):
+    async def ws_client_handler(self, ip, user, password):
         ws_port = self.config.get("ws_port", 81)
         uri = f"ws://{ip}:{ws_port}/"
         self.safe_log(f">> Connecting to WebSocket {uri}...\n")
         try:
-            async with websockets.connect(uri) as websocket:
+            extra_headers = {}
+            if user or password:
+                import base64
+                credentials = f"{user}:{password}"
+                encoded_creds = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+                extra_headers["Authorization"] = f"Basic {encoded_creds}"
+
+            async with websockets.connect(uri, additional_headers=extra_headers if extra_headers else None) as websocket:
                 self.ws_connection = websocket
                 self.is_ip_connected = True
                 self.root.after(0, lambda: self.ip_connect_btn.config(text="Disconnect IP"))
                 self.root.after(0, lambda: self.ip_entry.config(state="disabled"))
+                self.root.after(0, lambda: self.web_user_entry.config(state="disabled"))
+                self.root.after(0, lambda: self.web_pass_entry.config(state="disabled"))
                 self.safe_log(f">> Connected to ESP32 WebSocket at {ip}!\n")
                 
                 # Request initial status
@@ -533,6 +568,8 @@ class ESP32ControllerApp:
             self.ws_connection = None
             self.root.after(0, lambda: self.ip_connect_btn.config(text="Connect IP"))
             self.root.after(0, lambda: self.ip_entry.config(state="normal"))
+            self.root.after(0, lambda: self.web_user_entry.config(state="normal"))
+            self.root.after(0, lambda: self.web_pass_entry.config(state="normal"))
             self.safe_log(">> IP WebSocket Disconnected.\n")
 
     def disconnect_ip(self):
@@ -542,6 +579,8 @@ class ESP32ControllerApp:
         try:
             self.ip_connect_btn.config(text="Connect IP")
             self.ip_entry.config(state="normal")
+            self.web_user_entry.config(state="normal")
+            self.web_pass_entry.config(state="normal")
             self.log_message("WebSocket Disconnected.\n")
         except Exception:
             pass
@@ -606,7 +645,6 @@ class ESP32ControllerApp:
         try:
             data = json.loads(line)
             
-            # Support both flat keys and WebSocket JSON state wrappers
             if "type" in data and data["type"] == "state_update":
                 if "relays" in data:
                     for i, state in enumerate(data["relays"]):
@@ -621,7 +659,6 @@ class ESP32ControllerApp:
                     self.root.after(0, lambda v=dim_val: self.dimmer_slider.set(v))
                 return
 
-            # Direct key parsing
             for i in range(1, 5):
                 key = f"POWER{i}"
                 if key in data:

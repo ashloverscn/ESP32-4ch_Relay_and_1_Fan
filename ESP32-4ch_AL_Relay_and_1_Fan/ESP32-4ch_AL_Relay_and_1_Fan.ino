@@ -155,6 +155,7 @@ void all_Switch_ON();
 void all_Switch_OFF();
 void ir_remote();
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
+bool sendPeriodicStatus(void*);
 
 // --- Soft Buzzer Functions ---
 void beep(unsigned int frequency, unsigned long duration)
@@ -749,7 +750,7 @@ void dimm_Dn() {
     setDimmerLevel(dimmerValue);
 }
 
-// --- Relay Control ---
+// --- Active-LOW Relay Control with Full Serial / MQTT / Web Sync ---
 void setRelayState(int relay, bool turnOn) {
     int pin = 0;
     String prefKey = "";
@@ -763,7 +764,9 @@ void setRelayState(int relay, bool turnOn) {
 
     bool oldState = relayStates[relay - 1];
     relayStates[relay - 1] = turnOn;
-    digitalWrite(pin, turnOn ? LOW : HIGH); // LOW = Relay ON (Active-Low)
+    
+    // ACTIVE-LOW CONFIGURATION: LOW = Relay ON, HIGH = Relay OFF
+    digitalWrite(pin, turnOn ? LOW : HIGH); 
 
     preferences.begin("config", false);
     preferences.putUChar(prefKey.c_str(), turnOn ? 1 : 0);
@@ -771,6 +774,8 @@ void setRelayState(int relay, bool turnOn) {
 
     playStateFeedback(oldState != turnOn);
     logMessage(">> Relay " + String(relay) + " -> " + (turnOn ? "ON" : "OFF"));
+    
+    // Broadcast state updates to WebSockets, MQTT, and Serial to keep total sync
     broadcastState();
 }
 
@@ -783,6 +788,7 @@ void relayToggle(int relay) {
         case 4: pin = RelayPin4; break;
         default: return;
     }
+    // For Active-LOW, reading LOW means the relay is currently ON
     bool currentState = (digitalRead(pin) == LOW);
     setRelayState(relay, !currentState);
 }
@@ -851,6 +857,12 @@ void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState) {
             else if (pin == SwitchPin6) setDimmerLevel(DIMMER_MAX);
             break;
     }
+}
+
+// --- Periodic Status Telemetry ---
+bool sendPeriodicStatus(void*) {
+    broadcastState();
+    return true;
 }
 
 // --- Load and Save Configurations via Preferences (NVS) ---
@@ -925,6 +937,7 @@ String getStateJSON() {
 
 void broadcastState() {
     String out = getStateJSON();
+    Serial.println(out); // Outputs JSON over Serial for full system synchronization
     if (mqtt_enabled && mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
@@ -982,7 +995,6 @@ void checkButton() {
     else if (currentState == LOW && buttonStateLast == LOW) {
         unsigned long heldTime = millis() - buttonPressStartTime;
         
-        // 10-Second Very Long Press: Erase NVS & Boot into AP Mode
         if (heldTime >= VERY_LONG_PRESS_DURATION && !factoryResetTriggered) {
             factoryResetTriggered = true;
             logMessage(">> [FACTORY RESET] 10s Very Long Press detected! Erasing NVS storage & entering AP Mode...");
@@ -994,7 +1006,6 @@ void checkButton() {
             delay(500);
             enterAPMode();
         }
-        // 3-Second Long Press: Enter AP Configuration Mode
         else if (heldTime >= LONG_PRESS_DURATION && heldTime < VERY_LONG_PRESS_DURATION && !apTriggered && !apModeActive) {
             apTriggered = true;
             logMessage(">> 3s Long Press detected! Entering AP Configuration Mode...");
@@ -1027,7 +1038,7 @@ void setupOTARoutes(bool requireAuth) {
         HTTPUpload& upload = server.upload();
         if (upload.status == UPLOAD_FILE_START) {
             Serial.printf(">> [OTA] Update Start: %s\n", upload.filename.c_str());
-            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { // Start with unknown size for ESP32 stream chunking
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { 
                 Update.printError(Serial);
             }
         } else if (upload.status == UPLOAD_FILE_WRITE) {
@@ -1035,7 +1046,7 @@ void setupOTARoutes(bool requireAuth) {
                 Update.printError(Serial);
             }
         } else if (upload.status == UPLOAD_FILE_END) {
-            if (Update.end(true)) { // True to set the size to the current progress
+            if (Update.end(true)) { 
                 Serial.printf(">> [OTA] Update Success: %u bytes\nRebooting...\n", upload.totalSize);
             } else {
                 Update.printError(Serial);
@@ -1172,11 +1183,11 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
     }
 }
 
-// --- Reconnect MQTT (5-minute delay on failure, respects enabled flag) ---
+// --- Reconnect MQTT ---
 void reconnectMQTT() {
     if (mqtt_enabled && !apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
         static unsigned long lastMqttRetry = 0;
-        const unsigned long MQTT_RETRY_INTERVAL = 300000; // 5 minutes in milliseconds
+        const unsigned long MQTT_RETRY_INTERVAL = 300000; // 5 minutes
         
         if (millis() - lastMqttRetry >= MQTT_RETRY_INTERVAL || lastMqttRetry == 0) { 
             lastMqttRetry = millis();
@@ -1185,7 +1196,7 @@ void reconnectMQTT() {
             if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
                 logMessage(">> MQTT Connected!");
                 mqttClient.subscribe(mqtt_topic_cmd.c_str());
-                lastMqttRetry = 0; // Reset retry tracking on successful connection
+                lastMqttRetry = 0; 
             } else {
                 logMessage(">> MQTT Connection failed, rc=" + String(mqttClient.state()) + ". Retrying in 5 minutes...");
             }
@@ -1237,7 +1248,7 @@ void handleCommand(const String& cmd) {
     logMessage(">> " + trimmedCmd);
 }
 
-// --- Serial Batch Parser (50ms Silence Timeout) ---
+// --- Serial Batch Parser ---
 void processBufferedSerial(const String& data) {
     String bufferCopy = data;
     bufferCopy.trim();
@@ -1284,6 +1295,7 @@ void setup() {
     pinMode(TriacPin, OUTPUT);
     pinMode(BuzzerPin, OUTPUT);
 
+    // ACTIVE-LOW RELAYS: Initialize default state to HIGH (OFF)
     digitalWrite(RelayPin1, HIGH);
     digitalWrite(RelayPin2, HIGH);
     digitalWrite(RelayPin3, HIGH);

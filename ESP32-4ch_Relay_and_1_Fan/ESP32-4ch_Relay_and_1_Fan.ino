@@ -6,6 +6,7 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <IRremote.hpp>
 #include <AceButton.h>
 #include <arduino-timer.h>
@@ -24,6 +25,10 @@ const char* DEFAULT_MQTT_USER = "admin";
 const char* DEFAULT_MQTT_PASS = "admin1234S";
 const char* DEFAULT_MQTT_TOPIC_CMD = "home/esp32/command";
 const char* DEFAULT_MQTT_TOPIC_STATE = "home/esp32/state";
+const bool  DEFAULT_MQTT_ENABLED = true;
+
+const char* DEFAULT_WEB_USER = "admin";
+const char* DEFAULT_WEB_PASS = "admin1234S";
 
 // --- Runtime Configuration Variables ---
 String stored_ssid;
@@ -34,6 +39,9 @@ String mqtt_user;
 String mqtt_pass;
 String mqtt_topic_cmd;
 String mqtt_topic_state;
+bool mqtt_enabled;
+String stored_web_user;
+String stored_web_pass;
 
 // --- Pin Assignments ---
 const int RelayPin1     = 23;      
@@ -41,9 +49,9 @@ const int RelayPin2     = 22;
 const int RelayPin3     = 21;      
 const int RelayPin4     = 19;      
 const int TriacPin      = 18;          
-const int ZeroCrossPin = 34;    
-const int IR_RECV_PIN  = 35;     
-const int CONFIG_BUTTON_PIN = 0; // Boot button for manual AP mode trigger
+const int ZeroCrossPin  = 34;    
+const int IR_RECV_PIN   = 35;     
+const int CONFIG_BUTTON_PIN = 0; // Boot button for manual AP mode & factory reset
 
 // --- Wall Switch / Button Pins (AceButton) ---
 #define SwitchPin1 13 // Relay 1 Toggle
@@ -116,9 +124,17 @@ unsigned long wifiDisconnectedStartTime = 0;
 const unsigned long WIFI_AP_FALLBACK_TIMEOUT = 600000; // 10 minutes
 bool apModeActive = false;
 
+// --- GPIO 0 Button Press States (3s AP Mode & 10s Factory Reset) ---
+unsigned long buttonPressStartTime = 0;
+bool buttonStateLast = HIGH;
+const unsigned long LONG_PRESS_DURATION = 3000;       
+const unsigned long VERY_LONG_PRESS_DURATION = 10000; 
+bool apTriggered = false;
+bool factoryResetTriggered = false;
+
 // Forward Declarations
 void loadConfig();
-void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState);
+void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState, bool mEnabled, String wUser, String wPass);
 void broadcastState();
 void logMessage(const String& msg);
 void handleCommand(const String& cmd);
@@ -136,7 +152,7 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length);
 void checkWiFiConnection();
 void checkButton();
 void enterAPMode();
-bool sendPeriodicStatus(void*);
+void setupOTARoutes(bool requireAuth);
 void handleEvent(AceButton* button, uint8_t eventType, uint8_t buttonState);
 String getStateJSON();
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
@@ -309,10 +325,21 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         h2 { text-align: center; margin-top: 0; color: #333; }
         .back-link { display: inline-block; margin-bottom: 15px; text-decoration: none; color: #007bff; font-weight: bold; font-size: 14px; }
         label { font-weight: bold; font-size: 13px; color: #555; display: block; margin-top: 10px; }
-        input[type="text"], input[type="password"], input[type="number"] { padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; margin-top: 5px; margin-bottom: 5px; }
+        input[type="text"], input[type="password"], input[type="number"], input[type="file"] { padding: 8px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; margin-top: 5px; margin-bottom: 5px; }
+        .section-header-row { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; margin-bottom: 10px; }
+        .section-header-row h3 { margin: 0; color: #333; }
+        .checkbox-container { display: flex; align-items: center; gap: 6px; font-weight: bold; font-size: 13px; color: #333; cursor: pointer; }
+        .checkbox-container input { transform: scale(1.2); cursor: pointer; }
         hr { border: 0; border-top: 1px solid #eee; margin: 20px 0; }
         button { width: 100%; padding: 12px; font-size: 15px; border-radius: 4px; border: none; cursor: pointer; background-color: #28a745; color: white; font-weight: bold; margin-top: 15px; }
         button:hover { background-color: #218838; }
+        .btn-primary { background-color: #007bff; color: #fff; }
+        .btn-primary:hover { background-color: #0056b3; }
+        .btn-warning { background-color: #ffc107; color: #000; }
+        .btn-warning:hover { background-color: #e0a800; }
+        .btn-danger { background-color: #dc3545; color: #fff; }
+        .btn-danger:hover { background-color: #c82333; }
+        #otaStatus { margin-top: 10px; font-weight: bold; font-size: 13px; color: #007bff; text-align: center; }
     </style>
 </head>
 <body>
@@ -324,26 +351,55 @@ const char CONFIG_PAGE[] PROGMEM = R"rawliteral(
         <label>Wi-Fi SSID:</label><input type="text" name="wifi_ssid" id="cfg_ssid">
         <label>Wi-Fi Password:</label><input type="password" name="wifi_pass" id="cfg_pass_wifi">
         <hr>
-        <h3>MQTT Settings</h3>
+        
+        <div class="section-header-row">
+            <h3>MQTT Settings</h3>
+            <label class="checkbox-container">
+                <input type="checkbox" name="mqtt_enabled" id="cfg_enabled"> Enable MQTT
+            </label>
+        </div>
         <label>MQTT Server:</label><input type="text" name="mqtt_server" id="cfg_server">
         <label>MQTT Port:</label><input type="number" name="mqtt_port" id="cfg_port">
         <label>MQTT Username:</label><input type="text" name="mqtt_user" id="cfg_user">
         <label>MQTT Password:</label><input type="password" name="mqtt_pass" id="cfg_pass">
         <label>Command Topic:</label><input type="text" name="mqtt_topic_cmd" id="cfg_tcmd">
         <label>State Topic:</label><input type="text" name="mqtt_topic_state" id="cfg_tstate">
+
+        <hr>
+        <h3>Web Login Security</h3>
+        <label>Web Username:</label><input type="text" name="web_user" id="cfg_wuser">
+        <label>Web Password:</label><input type="password" name="web_pass" id="cfg_wpass">
+
         <button type="submit">Save & Reboot</button>
     </form>
+
+    <hr>
+    <h3>Firmware Update (OTA)</h3>
+    <form method="POST" action="/update" enctype="multipart/form-data" onsubmit="document.getElementById('otaStatus').innerText = 'Uploading & Flashing Firmware... Do not power off!';">
+        <label>Select Compiled Firmware (.bin):</label>
+        <input type="file" name="update" accept=".bin" required>
+        <button type="submit" class="btn-primary">Upload & Flash Firmware</button>
+        <div id="otaStatus"></div>
+    </form>
+
+    <hr>
+    <h3>Device Actions</h3>
+    <button type="button" class="btn-warning" onclick="if(confirm('Reboot into AP Mode?')) location.href='/reboot-ap'">Reboot to AP Mode</button>
+    <button type="button" class="btn-danger" onclick="if(confirm('WARNING: This will erase all settings and factory reset! Continue?')) location.href='/factory-reset'">Factory Reset</button>
 </div>
 <script>
     fetch('/get-config').then(res => res.json()).then(data => {
         document.getElementById('cfg_ssid').value = data.ssid || '';
         document.getElementById('cfg_pass_wifi').value = data.pass_wifi || '';
+        document.getElementById('cfg_enabled').checked = data.enabled === 1 || data.enabled === true;
         document.getElementById('cfg_server').value = data.server;
         document.getElementById('cfg_port').value = data.port;
         document.getElementById('cfg_user').value = data.user;
         document.getElementById('cfg_pass').value = data.pass;
         document.getElementById('cfg_tcmd').value = data.tcmd;
         document.getElementById('cfg_tstate').value = data.tstate;
+        document.getElementById('cfg_wuser').value = data.wuser || 'admin';
+        document.getElementById('cfg_wpass').value = data.wpass || 'admin1234S';
     });
 </script>
 </body>
@@ -519,6 +575,12 @@ void loadConfig() {
     mqtt_pass = preferences.getString("pass", DEFAULT_MQTT_PASS);
     mqtt_topic_cmd = preferences.getString("tcmd", DEFAULT_MQTT_TOPIC_CMD);
     mqtt_topic_state = preferences.getString("tstate", DEFAULT_MQTT_TOPIC_STATE);
+    mqtt_enabled = preferences.getBool("enabled", DEFAULT_MQTT_ENABLED);
+    stored_web_user = preferences.getString("wuser", DEFAULT_WEB_USER);
+    stored_web_pass = preferences.getString("wpass", DEFAULT_WEB_PASS);
+
+    if (stored_web_user.length() == 0 || stored_web_user.length() > 32) stored_web_user = DEFAULT_WEB_USER;
+    if (stored_web_pass.length() == 0 || stored_web_pass.length() > 32) stored_web_pass = DEFAULT_WEB_PASS;
 
     uint8_t r1 = preferences.getUChar("relay1", 0);
     uint8_t r2 = preferences.getUChar("relay2", 0);
@@ -537,7 +599,7 @@ void loadConfig() {
     applyDimmer();
 }
 
-void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState) {
+void saveConfig(String ssid, String pass, String srv, int prt, String usr, String pwd, String tCmd, String tState, bool mEnabled, String wUser, String wPass) {
     preferences.begin("config", false);
     preferences.putString("ssid", ssid);
     preferences.putString("password", pass);
@@ -547,10 +609,13 @@ void saveConfig(String ssid, String pass, String srv, int prt, String usr, Strin
     preferences.putString("pass", pwd);
     preferences.putString("tcmd", tCmd);
     preferences.putString("tstate", tState);
+    preferences.putBool("enabled", mEnabled);
+    preferences.putString("wuser", wUser);
+    preferences.putString("wpass", wPass);
     preferences.end();
 }
 
-// --- State JSON Helper (All 4 Relays Included) ---
+// --- State JSON Helper ---
 String getStateJSON() {
     JsonDocument doc;
     doc["POWER1"] = relayStates[0] ? "ON" : "OFF";
@@ -590,20 +655,75 @@ void checkWiFiConnection() {
     }
 }
 
+// --- GPIO 0 Button Handler (3s AP Mode & 10s Factory Reset) ---
 void checkButton() {
-    if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
-        delay(50);
-        if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
-            unsigned long pressTime = millis();
-            while (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
-                if (millis() - pressTime > 3000) {
-                    logMessage(">> Long press on GPIO 0 detected! Entering AP Setup Mode...");
-                    enterAPMode();
-                    return;
-                }
+    int currentState = digitalRead(CONFIG_BUTTON_PIN);
+    
+    if (currentState == LOW && buttonStateLast == HIGH) {
+        buttonPressStartTime = millis();
+        buttonStateLast = LOW;
+        apTriggered = false;
+        factoryResetTriggered = false;
+    } 
+    else if (currentState == LOW && buttonStateLast == LOW) {
+        unsigned long heldTime = millis() - buttonPressStartTime;
+        
+        if (heldTime >= VERY_LONG_PRESS_DURATION && !factoryResetTriggered) {
+            factoryResetTriggered = true;
+            logMessage(">> [FACTORY RESET] 10s Very Long Press detected! Erasing NVS storage & entering AP Mode...");
+            preferences.begin("config", false);
+            preferences.clear();
+            preferences.end();
+            delay(500);
+            enterAPMode();
+        }
+        else if (heldTime >= LONG_PRESS_DURATION && heldTime < VERY_LONG_PRESS_DURATION && !apTriggered && !apModeActive) {
+            apTriggered = true;
+            logMessage(">> 3s Long Press detected! Entering AP Configuration Mode...");
+            enterAPMode();
+        }
+    } 
+    else if (currentState == HIGH && buttonStateLast == LOW) {
+        buttonStateLast = HIGH;
+    }
+}
+
+// --- ESP32 Web OTA Firmware Update Handler ---
+void setupOTARoutes(bool requireAuth) {
+    server.on("/update", HTTP_POST, [requireAuth]() {
+        if (requireAuth && !server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.sendHeader("Connection", "close");
+        if (Update.hasError()) {
+            server.send(200, "text/html", "<h3>OTA Update Failed! Rebooting...</h3><script>setTimeout(()=>{window.location='/'}, 4000);</script>");
+        } else {
+            server.send(200, "text/html", "<h3>OTA Update Successful! Rebooting ESP32...</h3><script>setTimeout(()=>{window.location='/'}, 6000);</script>");
+        }
+        delay(1000);
+        ESP.restart();
+    }, [requireAuth]() {
+        if (requireAuth && !server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return;
+        }
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            Serial.printf(">> [OTA] Update Start: %s\n", upload.filename.c_str());
+            if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) {
+                Serial.printf(">> [OTA] Update Success: %u bytes\nRebooting...\n", upload.totalSize);
+            } else {
+                Update.printError(Serial);
             }
         }
-    }
+    });
 }
 
 void enterAPMode() {
@@ -620,30 +740,59 @@ void enterAPMode() {
     server.stop();
 
     server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
+    server.on("/config", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
     server.on("/get-config", HTTP_GET, []() {
         JsonDocument doc;
-        doc["ssid"] = stored_ssid; doc["pass_wifi"] = stored_password;
-        doc["server"] = mqtt_server; doc["port"] = mqtt_port;
-        doc["user"] = mqtt_user; doc["pass"] = mqtt_pass;
-        doc["tcmd"] = mqtt_topic_cmd; doc["tstate"] = mqtt_topic_state;
+        doc["ssid"] = stored_ssid; 
+        doc["pass_wifi"] = stored_password;
+        doc["enabled"] = mqtt_enabled;
+        doc["server"] = mqtt_server; 
+        doc["port"] = mqtt_port;
+        doc["user"] = mqtt_user; 
+        doc["pass"] = mqtt_pass;
+        doc["tcmd"] = mqtt_topic_cmd; 
+        doc["tstate"] = mqtt_topic_state;
+        doc["wuser"] = stored_web_user;
+        doc["wpass"] = stored_web_pass;
         String response; serializeJson(doc, response);
         server.send(200, "application/json", response);
     });
     server.on("/save-settings", HTTP_POST, []() {
         String s_ssid = server.hasArg("wifi_ssid") ? server.arg("wifi_ssid") : DEFAULT_SSID;
         String s_pass = server.hasArg("wifi_pass") ? server.arg("wifi_pass") : DEFAULT_PASSWORD;
+        bool mEnabled = server.hasArg("mqtt_enabled");
         String srv = server.hasArg("mqtt_server") ? server.arg("mqtt_server") : DEFAULT_MQTT_SERVER;
         int prt = server.hasArg("mqtt_port") ? server.arg("mqtt_port").toInt() : DEFAULT_MQTT_PORT;
         String usr = server.hasArg("mqtt_user") ? server.arg("mqtt_user") : DEFAULT_MQTT_USER;
         String pwd = server.hasArg("mqtt_pass") ? server.arg("mqtt_pass") : DEFAULT_MQTT_PASS;
         String tCmd = server.hasArg("mqtt_topic_cmd") ? server.arg("mqtt_topic_cmd") : DEFAULT_MQTT_TOPIC_CMD;
         String tState = server.hasArg("mqtt_topic_state") ? server.arg("mqtt_topic_state") : DEFAULT_MQTT_TOPIC_STATE;
+        String wUser = server.hasArg("web_user") && server.arg("web_user") != "" ? server.arg("web_user") : DEFAULT_WEB_USER;
+        String wPass = server.hasArg("web_pass") && server.arg("web_pass") != "" ? server.arg("web_pass") : DEFAULT_WEB_PASS;
 
-        saveConfig(s_ssid, s_pass, srv, prt, usr, pwd, tCmd, tState);
+        saveConfig(s_ssid, s_pass, srv, prt, usr, pwd, tCmd, tState, mEnabled, wUser, wPass);
         server.send(200, "text/html", "<h3>Settings Saved! Restarting ESP32...</h3><script>setTimeout(()=>{window.location='/'}, 4000);</script>");
         delay(1000);
         ESP.restart();
     });
+
+    setupOTARoutes(false);
+
+    server.on("/reboot-ap", HTTP_GET, []() {
+        server.send(200, "text/html", "<h3>Rebooting to AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
+    server.on("/factory-reset", HTTP_GET, []() {
+        preferences.begin("config", false);
+        preferences.clear();
+        preferences.end();
+        server.send(200, "text/html", "<h3>Factory Reset Complete! Entering AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
     server.begin();
 }
 
@@ -687,15 +836,20 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
 }
 
 void reconnectMQTT() {
-    if (!apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
+    if (mqtt_enabled && !apModeActive && !mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
         static unsigned long lastMqttRetry = 0;
-        if (millis() - lastMqttRetry > 10000) { 
+        const unsigned long MQTT_RETRY_INTERVAL = 300000; // 5 minutes
+        
+        if (millis() - lastMqttRetry >= MQTT_RETRY_INTERVAL || lastMqttRetry == 0) { 
             lastMqttRetry = millis();
             String clientId = "ESP32Gateway-" + String((uint32_t)ESP.getEfuseMac(), HEX);
             if (mqttClient.connect(clientId.c_str(), mqtt_user.c_str(), mqtt_pass.c_str())) {
                 mqttClient.subscribe(mqtt_topic_cmd.c_str());
                 logMessage(">> MQTT Connected & Subscribed!");
+                lastMqttRetry = 0;
                 broadcastState(); 
+            } else {
+                logMessage(">> MQTT Connection failed, rc=" + String(mqttClient.state()) + ". Retrying in 5 minutes...");
             }
         }
     }
@@ -705,6 +859,15 @@ void reconnectMQTT() {
 void handleCommand(const String& cmd) {
     String trimmedCmd = cmd;
     trimmedCmd.trim();
+
+    JsonDocument cmdDoc;
+    cmdDoc["command"] = trimmedCmd;
+    String pubPayload;
+    serializeJson(cmdDoc, pubPayload);
+    
+    if (mqtt_enabled && mqttClient.connected()) {
+        mqttClient.publish(mqtt_topic_cmd.c_str(), pubPayload.c_str());
+    }
 
     for (int i = 1; i <= 4; i++) {
         if (trimmedCmd == "POWER" + String(i) + " ON") {
@@ -745,16 +908,11 @@ void handleCommand(const String& cmd) {
 // --- State Broadcast ---
 void broadcastState() {
     String out = getStateJSON();
-    if (mqttClient.connected()) {
+    if (mqtt_enabled && mqttClient.connected()) {
         mqttClient.publish(mqtt_topic_state.c_str(), out.c_str());
     }
     webSocket.broadcastTXT(out);
     logMessage(">> STATE BROADCAST: " + out);
-}
-
-bool sendPeriodicStatus(void*) {
-    broadcastState();
-    return true;
 }
 
 // --- AceButton Event Handler ---
@@ -851,36 +1009,90 @@ void setup() {
         logMessage(">> WiFi Connection Failed. Entering background retry mode...");
     }
 
-    espClient.setInsecure();
-    mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
-    mqttClient.setCallback(callbackMQTT);
-    mqttClient.setBufferSize(512);
+    if (mqtt_enabled) {
+        espClient.setInsecure();
+        mqttClient.setServer(mqtt_server.c_str(), mqtt_port);
+        mqttClient.setCallback(callbackMQTT);
+        mqttClient.setBufferSize(512);
+    }
 
-    server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", HTML_TEMPLATE); });
-    server.on("/config", HTTP_GET, []() { server.send_P(200, "text/html", CONFIG_PAGE); });
+    server.on("/", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.send_P(200, "text/html", HTML_TEMPLATE);
+    });
+
+    server.on("/config", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.send_P(200, "text/html", CONFIG_PAGE);
+    });
+
     server.on("/get-config", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
         JsonDocument doc;
-        doc["ssid"] = stored_ssid; doc["pass_wifi"] = stored_password;
-        doc["server"] = mqtt_server; doc["port"] = mqtt_port;
-        doc["user"] = mqtt_user; doc["pass"] = mqtt_pass;
-        doc["tcmd"] = mqtt_topic_cmd; doc["tstate"] = mqtt_topic_state;
+        doc["ssid"] = stored_ssid; 
+        doc["pass_wifi"] = stored_password;
+        doc["enabled"] = mqtt_enabled;
+        doc["server"] = mqtt_server; 
+        doc["port"] = mqtt_port;
+        doc["user"] = mqtt_user; 
+        doc["pass"] = mqtt_pass;
+        doc["tcmd"] = mqtt_topic_cmd; 
+        doc["tstate"] = mqtt_topic_state;
+        doc["wuser"] = stored_web_user;
+        doc["wpass"] = stored_web_pass;
         String response; serializeJson(doc, response);
         server.send(200, "application/json", response);
     });
+
     server.on("/save-settings", HTTP_POST, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
         String s_ssid = server.hasArg("wifi_ssid") ? server.arg("wifi_ssid") : DEFAULT_SSID;
         String s_pass = server.hasArg("wifi_pass") ? server.arg("wifi_pass") : DEFAULT_PASSWORD;
+        bool mEnabled = server.hasArg("mqtt_enabled");
         String srv = server.hasArg("mqtt_server") ? server.arg("mqtt_server") : DEFAULT_MQTT_SERVER;
         int prt = server.hasArg("mqtt_port") ? server.arg("mqtt_port").toInt() : DEFAULT_MQTT_PORT;
         String usr = server.hasArg("mqtt_user") ? server.arg("mqtt_user") : DEFAULT_MQTT_USER;
         String pwd = server.hasArg("mqtt_pass") ? server.arg("mqtt_pass") : DEFAULT_MQTT_PASS;
         String tCmd = server.hasArg("mqtt_topic_cmd") ? server.arg("mqtt_topic_cmd") : DEFAULT_MQTT_TOPIC_CMD;
         String tState = server.hasArg("mqtt_topic_state") ? server.arg("mqtt_topic_state") : DEFAULT_MQTT_TOPIC_STATE;
+        String wUser = server.hasArg("web_user") && server.arg("web_user") != "" ? server.arg("web_user") : DEFAULT_WEB_USER;
+        String wPass = server.hasArg("web_pass") && server.arg("web_pass") != "" ? server.arg("web_pass") : DEFAULT_WEB_PASS;
 
-        saveConfig(s_ssid, s_pass, srv, prt, usr, pwd, tCmd, tState);
+        saveConfig(s_ssid, s_pass, srv, prt, usr, pwd, tCmd, tState, mEnabled, wUser, wPass);
         server.send(200, "text/html", "<h3>Settings Saved! Restarting ESP32...</h3><script>setTimeout(()=>{window.location='/'}, 4000);</script>");
         delay(1000);
         ESP.restart();
+    });
+
+    setupOTARoutes(true);
+
+    server.on("/reboot-ap", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        server.send(200, "text/html", "<h3>Rebooting to AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
+    });
+
+    server.on("/factory-reset", HTTP_GET, []() {
+        if (!server.authenticate(stored_web_user.c_str(), stored_web_pass.c_str())) {
+            return server.requestAuthentication();
+        }
+        preferences.begin("config", false);
+        preferences.clear();
+        preferences.end();
+        server.send(200, "text/html", "<h3>Factory Reset Complete! Entering AP Mode...</h3>");
+        delay(1000);
+        enterAPMode();
     });
 
     server.begin();
@@ -906,10 +1118,12 @@ void loop() {
 
     checkWiFiConnection();
 
-    if (!mqttClient.connected()) {
-        reconnectMQTT();
+    if (mqtt_enabled) {
+        if (!mqttClient.connected()) {
+            reconnectMQTT();
+        }
+        mqttClient.loop();
     }
-    mqttClient.loop();
 
     webSocket.loop();
     server.handleClient();
